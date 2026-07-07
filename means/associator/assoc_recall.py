@@ -6,11 +6,17 @@ Silently injects top-K semantically unexpected but relevant memory nodes
 into the conversation context. Any error → exit 0 with empty output (never blocks).
 """
 import json
+import os
 import sys
 import signal
 
 # Hard deadline for entire hook (cache load + PPR run)
 TIMEOUT_SECS = 4
+
+# Fork config: где лежит пакет ассоциатора (ppr_memory_v2.py + журнал выдач).
+# Форкающий указывает свой путь через env; дефолт — установка Арета.
+ASSOCIATOR_HOME = os.environ.get("MYCELIUM_ASSOCIATOR_HOME",
+                                 "/home/claude-user/memory-proto")
 
 def _handle_timeout(signum, frame):
     raise TimeoutError("assoc_recall timeout")
@@ -29,7 +35,7 @@ def main() -> None:
             print("{}", flush=True)
             return
 
-        sys.path.insert(0, "/home/claude-user/memory-proto")
+        sys.path.insert(0, ASSOCIATOR_HOME)
         from ppr_memory_v2 import load_cache, associate
 
         cache = load_cache()
@@ -40,7 +46,7 @@ def main() -> None:
         # Наблюдаемость: журнал выдач для оценки пользы слоя (вопрос Евгения 03.07)
         try:
             import datetime
-            with open("/home/claude-user/memory-proto/assoc_log.jsonl", "a") as lf:
+            with open(os.path.join(ASSOCIATOR_HOME, "assoc_log.jsonl"), "a") as lf:
                 lf.write(json.dumps({
                     "ts": datetime.datetime.now().isoformat(timespec="seconds"),
                     "prompt": prompt[:100],

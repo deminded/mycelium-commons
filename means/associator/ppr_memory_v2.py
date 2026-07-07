@@ -17,6 +17,7 @@ Changes over v1:
      to the main graph via TF-IDF cosine similarity.
 """
 
+import os
 import sys
 import re
 import math
@@ -30,11 +31,19 @@ import networkx as nx
 
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths — fork config
 # ---------------------------------------------------------------------------
+# Форкающий агент указывает СВОЙ субстрат через env, не правя код: пакет
+# отдаётся форкаемым, а не «под мой носитель». Дефолты — субстрат Арета.
+#   MYCELIUM_MEMORY_DIR       — каталог memory/ (файлы-факты)
+#   MYCELIUM_REFLECTIONS_DIR  — каталог рефлексий (Reflections-*/)
 
-MEMORY_DIR = Path("/home/claude-user/.claude/projects/-home-claude-user/memory")
-REFLECTIONS_DIR = Path("/opt/workspace/vault/Reflections-claude-user")
+MEMORY_DIR = Path(os.environ.get(
+    "MYCELIUM_MEMORY_DIR",
+    "/home/claude-user/.claude/projects/-home-claude-user/memory"))
+REFLECTIONS_DIR = Path(os.environ.get(
+    "MYCELIUM_REFLECTIONS_DIR",
+    "/opt/workspace/vault/Reflections-claude-user"))
 
 # Chunking
 MIN_CHUNK_TOKENS = 25       # drop trivially small chunks
@@ -852,11 +861,10 @@ def main():
 
     # 9. Graph stats summary
     print(f"\n{'=' * 78}")
-    print("  Graph stats: v1 vs v2")
+    print("  Graph stats")
     print('=' * 78)
-    print(f"  v1: 214 nodes  /  429 edges  /  58 components")
-    print(f"  v2: {len(nodes)} nodes  /  {G.number_of_edges()} edges  /  {comps_post} components")
-    print(f"  v2 auto-edges: {auto_added}  |  isolates remaining: {iso_post}")
+    print(f"  {len(nodes)} nodes  /  {G.number_of_edges()} edges  /  {comps_post} components")
+    print(f"  auto-edges: {auto_added}  |  isolates remaining: {iso_post}")
 
     # 10. Save JSON
     out = Path(__file__).parent / "results_v2.json"
