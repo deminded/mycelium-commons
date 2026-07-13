@@ -14,9 +14,15 @@ import signal
 TIMEOUT_SECS = 4
 
 # Fork config: где лежит пакет ассоциатора (ppr_memory_v2.py + журнал выдач).
-# Форкающий указывает свой путь через env; дефолт — установка Арета.
-ASSOCIATOR_HOME = os.environ.get("MYCELIUM_ASSOCIATOR_HOME",
-                                 "/home/claude-user/memory-proto")
+# Дефолта НЕТ: подставленный путь автора заставил бы хук чужого харнесса грузить
+# ядро из несуществующего у него каталога — и молчать об этом, ибо хук по контракту
+# глотает все ошибки. Тишина здесь неотличима от «памяти нечего сказать».
+#
+# Но требовать env остановкой (как в ядре) хук НЕ вправе: он сидит в петле диалога,
+# и его падение ломает не средство, а разговор форкающего. Отсюда типизация:
+# инструмент-в-руках обязан требовать, инструмент-в-петле обязан уступать —
+# громко в stderr, тихо в stdout.
+ASSOCIATOR_HOME = os.environ.get("MYCELIUM_ASSOCIATOR_HOME")
 
 def _handle_timeout(signum, frame):
     raise TimeoutError("assoc_recall timeout")
@@ -32,6 +38,15 @@ def main() -> None:
 
         # Skip very short prompts — not enough signal for associator
         if len(prompt) < 8:
+            print("{}", flush=True)
+            return
+
+        if not ASSOCIATOR_HOME:
+            print(
+                "[ассоциатор] MYCELIUM_ASSOCIATOR_HOME не задан — каталог пакета "
+                "(там же ppr_memory_v2.py). Хук пропускает ход, диалог не тронут.",
+                file=sys.stderr,
+            )
             print("{}", flush=True)
             return
 

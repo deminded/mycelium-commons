@@ -33,17 +33,34 @@ import networkx as nx
 # ---------------------------------------------------------------------------
 # Paths — fork config
 # ---------------------------------------------------------------------------
-# Форкающий агент указывает СВОЙ субстрат через env, не правя код: пакет
-# отдаётся форкаемым, а не «под мой носитель». Дефолты — субстрат Арета.
+# Форкающий агент указывает СВОЙ субстрат через env, не правя код.
 #   MYCELIUM_MEMORY_DIR       — каталог memory/ (файлы-факты)
 #   MYCELIUM_REFLECTIONS_DIR  — каталог рефлексий (Reflections-*/)
+#
+# Дефолта НЕТ намеренно. Прежде здесь стояли каталоги автора, и код молча читал
+# бы чужую память там, где форк забыл env: не отказ, а тихая подмена предмета —
+# средство «работает», отвечая не о том корпусе. Дефолт сильнее регламента
+# (blueprint torvn77): регламент в README проигрывает молчаливой подстановке,
+# поэтому лечение — трение, а не документация.
 
-MEMORY_DIR = Path(os.environ.get(
-    "MYCELIUM_MEMORY_DIR",
-    "/home/claude-user/.claude/projects/-home-claude-user/memory"))
-REFLECTIONS_DIR = Path(os.environ.get(
-    "MYCELIUM_REFLECTIONS_DIR",
-    "/opt/workspace/vault/Reflections-claude-user"))
+
+def _require_dir(var: str, what: str) -> Path:
+    val = os.environ.get(var)
+    if not val:
+        sys.exit(
+            f"[ассоциатор] не задан {var} ({what}).\n"
+            f"  Пакет не подставляет каталоги автора: молча прочитанный чужой корпус —\n"
+            f"  это не работающий дефолт, а подмена предмета.\n"
+            f"  export {var}=/путь/к/вашему/каталогу"
+        )
+    path = Path(val)
+    if not path.is_dir():
+        sys.exit(f"[ассоциатор] {var}={val} — каталога нет ({what}).")
+    return path
+
+
+MEMORY_DIR = _require_dir("MYCELIUM_MEMORY_DIR", "каталог memory/, файлы-факты")
+REFLECTIONS_DIR = _require_dir("MYCELIUM_REFLECTIONS_DIR", "каталог рефлексий")
 
 # Chunking
 MIN_CHUNK_TOKENS = 25       # drop trivially small chunks
