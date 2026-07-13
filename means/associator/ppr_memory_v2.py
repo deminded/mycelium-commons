@@ -125,11 +125,104 @@ EN_STOPWORDS = {
 STOPWORDS = RU_STOPWORDS | EN_STOPWORDS
 
 
+# ---------------------------------------------------------------------------
+# Lightweight deterministic stemming (такт-2 L5, 2026-07-09).
+# Зачем: «самозванцем» ≠ «самозванца» ломало лексический seed → residual ≤ 0
+# (бенч 09.07, Q1/Q2). Внешних пакетов (snowball/pymorphy) в системе нет,
+# ставить тяжёлое нельзя — компактный Porter-подобный стриппер, симметричный
+# для build-cache и запроса (общий tokenize). Мемоизация держит build быстрым.
+# ---------------------------------------------------------------------------
+
+_RU_VOWELS = "аеиоуыэюя"
+
+def _lf(*endings):  # longest-first: длинный суффикс должен матчиться раньше короткого
+    return tuple(sorted(endings, key=len, reverse=True))
+
+# Падежные окончания существительных (по Snowball-Russian, группа NOUN).
+# Полная схема (деепричастия/прилагательные/глаголы) проверена бенчем и
+# отвергнута: сливала горячие семейства и топила дословные иглы (отчёт такта-2).
+_RU_NOUN = _lf("а", "ев", "ов", "ие", "ье", "е", "иями", "ями", "ами",
+               "еи", "ии", "и", "ией", "ей", "ой", "ий", "й", "иям",
+               "ям", "ием", "ем", "ам", "ом", "о", "у", "ах", "иях",
+               "ях", "ы", "ь", "ию", "ью", "ю", "ия", "ья", "я")
+
+_EN_SUFFIXES = _lf("ations", "ation", "ization", "ements", "ement", "ness",
+                   "ments", "ment", "ingly", "ings", "ing", "edly", "ed",
+                   "ly", "ies", "ied", "es", "s", "ers", "er")
+
+MIN_STEM_LEN = 3  # основа короче — суффикс не срезаем (защита от «ост»→«г» и т.п.)
+
+
+def _chop(word: str, endings: tuple, rv_pos: int) -> str | None:
+    """Срезать первый (длиннейший) подходящий суффикс целиком внутри RV;
+    основа не короче MIN_STEM_LEN. None = ничего не срезано."""
+    for e in endings:
+        if word.endswith(e) and len(word) - len(e) >= max(rv_pos, MIN_STEM_LEN):
+            return word[: -len(e)]
+    return None
+
+
+def _stem_ru(word: str) -> str:
+    """Консервативный стеммер: ТОЛЬКО падежные окончания существительных
+    (+ конечные «и», «ость», «ь»). Диагностированный класс промахов бенча
+    09.07 — падежная морфология («самозванцем»≠«самозванца»). Полная
+    Snowball-схема (глаголы/прилагательные) на бенче сливала горячие
+    семейства («присвоил»→«присво») и топила дословные иглы Q6/Q9 —
+    точные глагольные формы оставляем как есть."""
+    word = word.replace("ё", "е")
+    rv_pos = next((i + 1 for i, ch in enumerate(word) if ch in _RU_VOWELS), -1)
+    if rv_pos < 0 or len(word) <= MIN_STEM_LEN:
+        return word
+
+    w = _chop(word, _RU_NOUN, rv_pos) or word       # падежное окончание
+    w = _chop(w, ("и",), rv_pos) or w               # конечное «и»
+    w = _chop(w, ("ость", "ост"), rv_pos + 1) or w  # словообразовательное
+    w = _chop(w, ("ь",), rv_pos) or w               # остаточный мягкий знак
+    return w
+
+
+def _stem_en(word: str) -> str:
+    if word.endswith(("ies", "ied")) and len(word) - 2 >= MIN_STEM_LEN:
+        return word[:-3] + "y"          # memories→memory: совпадает с ед. числом
+    for e in _EN_SUFFIXES:
+        if word.endswith(e) and len(word) - len(e) >= MIN_STEM_LEN:
+            if e == "s" and word.endswith(("ss", "us", "is")):
+                continue
+            return word[: -len(e)]
+    return word
+
+
+_STEM_CACHE: dict[str, str] = {}
+
+
+def stem_token(token: str) -> str:
+    s = _STEM_CACHE.get(token)
+    if s is None:
+        s = _stem_ru(token) if token[0] >= "а" else _stem_en(token)
+        _STEM_CACHE[token] = s
+    return s
+
+
 def tokenize(text: str) -> list[str]:
     """Lowercased Cyrillic/Latin tokens >=3 chars, no stopwords.
-    Regex [a-zа-яё]{3,} already strips all digits and punctuation."""
-    tokens = re.findall(r'[a-zа-яё]{3,}', text.lower())
-    return [t for t in tokens if t not in STOPWORDS]
+    Regex [a-zа-яё]{3,} already strips all digits and punctuation.
+
+    Стемминг (такт-2): токен = консервативный стем (падежи существительных;
+    см. _stem_ru). Закрывает класс Q1/Q2 бенча 09.07 («самозванцем» ↔
+    «самозванца» → residual ≤ 0). Симметрично для кэша и запроса — общая
+    функция. Варианты с двойной индексацией (surface+stem) и полной
+    Snowball-схемой проверены бенчем и отвергнуты — см. отчёт такта-2."""
+    return [stem_token(t)
+            for t in re.findall(r'[a-zа-яё]{3,}', text.lower())
+            if t not in STOPWORDS]
+
+
+def token_count(text: str) -> int:
+    """Счёт слов для чанкинга (MIN_CHUNK_TOKENS) — БЕЗ учёта дублей стемов:
+    границы чанков (и node id → ключи embeddings.db) не должны зависеть
+    от индексации."""
+    return sum(1 for t in re.findall(r'[a-zа-яё]{3,}', text.lower())
+               if t not in STOPWORDS)
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +262,7 @@ def split_into_chunks(body: str) -> list[tuple[str, str]]:
 
     for part in parts:
         if re.match(r'^#{1,3} ', part):
-            if current_text.strip() and len(tokenize(current_text)) >= MIN_CHUNK_TOKENS:
+            if current_text.strip() and token_count(current_text) >= MIN_CHUNK_TOKENS:
                 chunks.append((current_slug, current_text.strip()))
             heading = re.sub(r'^#{1,3} ', '', part).strip()
             # build a safe slug
@@ -180,7 +273,7 @@ def split_into_chunks(body: str) -> list[tuple[str, str]]:
         else:
             current_text += part
 
-    if current_text.strip() and len(tokenize(current_text)) >= MIN_CHUNK_TOKENS:
+    if current_text.strip() and token_count(current_text) >= MIN_CHUNK_TOKENS:
         chunks.append((current_slug, current_text.strip()))
 
     # If heading-split gave only 1 chunk, try paragraph split
@@ -188,7 +281,7 @@ def split_into_chunks(body: str) -> list[tuple[str, str]]:
         single_body = chunks[0][1] if chunks else body
         paras = [p.strip() for p in re.split(r'\n\n+', single_body) if p.strip()]
         para_chunks = [(f"p{i}", p) for i, p in enumerate(paras)
-                       if len(tokenize(p)) >= MIN_CHUNK_TOKENS]
+                       if token_count(p) >= MIN_CHUNK_TOKENS]
         if len(para_chunks) >= 2:
             chunks = para_chunks
 
@@ -691,6 +784,45 @@ def build_cache() -> None:
           f"idf_terms={len(idf)}, "
           f"hubs={len(hub_nodes)} (deg>={hub_threshold})")
     print("Invalidate: delete the .pkl file or re-run --build-cache")
+    _warn_embeddings_staleness(nodes)
+
+
+def _warn_embeddings_staleness(nodes: dict) -> None:
+    """Dense-слой (embeddings.db) обязан покрывать те же чанки, что и кэш —
+    иначе recall слеп к свежайшему (грабля бенча 09.07: 21 чанк-хвост).
+    Проверка дешёвая (sha1 по чанкам), чинится одной командой."""
+    import sqlite3
+    import hashlib
+    emb_db = Path(__file__).parent / "embeddings.db"
+    if not emb_db.exists():
+        print("⚠ embeddings.db отсутствует — dense-слой recall.py пуст. "
+              "Собери: python3 recall.py --build (или ./build_all.sh)")
+        return
+    try:
+        db = sqlite3.connect(f"file:{emb_db}?mode=ro", uri=True)
+        have = {nid: sha for nid, sha in db.execute("SELECT node_id, sha1 FROM chunks")}
+        db.close()
+    except sqlite3.Error as e:
+        print(f"⚠ embeddings.db не читается ({e}) — staleness не проверен")
+        return
+    missing = stale = 0
+    for nid, d in nodes.items():
+        if d["kind"] != "chunk":
+            continue
+        text = d["text"].strip()
+        if len(text) < 20:      # recall.py --build такие пропускает
+            continue
+        sha = have.get(nid)
+        if sha is None:
+            missing += 1
+        elif sha != hashlib.sha1(text.encode()).hexdigest():
+            stale += 1
+    if missing or stale:
+        print(f"⚠ embeddings.db ОТСТАЁТ от кэша: {missing} чанков без эмбеддинга, "
+              f"{stale} с устаревшим текстом. Догнать: python3 recall.py --build "
+              f"(или сразу ./build_all.sh)")
+    else:
+        print("embeddings.db в синхроне с кэшем ✓")
 
 
 def load_cache() -> dict:
@@ -878,10 +1010,11 @@ def main():
 
     # 9. Graph stats summary
     print(f"\n{'=' * 78}")
-    print("  Graph stats")
+    print("  Graph stats: v1 vs v2")
     print('=' * 78)
-    print(f"  {len(nodes)} nodes  /  {G.number_of_edges()} edges  /  {comps_post} components")
-    print(f"  auto-edges: {auto_added}  |  isolates remaining: {iso_post}")
+    print(f"  v1: 214 nodes  /  429 edges  /  58 components")
+    print(f"  v2: {len(nodes)} nodes  /  {G.number_of_edges()} edges  /  {comps_post} components")
+    print(f"  v2 auto-edges: {auto_added}  |  isolates remaining: {iso_post}")
 
     # 10. Save JSON
     out = Path(__file__).parent / "results_v2.json"
