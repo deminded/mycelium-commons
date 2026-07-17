@@ -7,6 +7,7 @@ into the conversation context. Any error → exit 0 with empty output (never blo
 """
 import json
 import os
+import re
 import sys
 import signal
 
@@ -24,6 +25,25 @@ TIMEOUT_SECS = 4
 # громко в stderr, тихо в stdout.
 ASSOCIATOR_HOME = os.environ.get("MYCELIUM_ASSOCIATOR_HOME")
 
+# Рамка task-notification (Claude Code) лексически жирнее содержания: на живых
+# промахах ассоциатор отвечал портретом ОБЁРТКИ (tool-use-id, /tmp/-пути, теги
+# давали устойчивый ложный фон), а под ней 4/5 оказались попаданиями.
+# Срезаем рамку, оставляем summary — предмет; внутри summary не режем ничего.
+# Контракт тега — харнессный: у всякого форка на Claude Code рамка та же.
+_SUMMARY_RE = re.compile(r"<summary>(.*?)</summary>", re.DOTALL)
+
+
+def strip_frame(prompt: str):
+    """Return (clean_text, was_stripped). Пустой summary → пустая строка:
+    молчание честнее уверенного фона от упаковки."""
+    if "<task-notification>" not in prompt:
+        return prompt, False
+    summaries = [s.strip() for s in _SUMMARY_RE.findall(prompt) if s.strip()]
+    if not summaries:
+        return "", True
+    return "\n".join(summaries), True
+
+
 def _handle_timeout(signum, frame):
     raise TimeoutError("assoc_recall timeout")
 
@@ -35,8 +55,11 @@ def main() -> None:
 
         data = json.load(sys.stdin)
         prompt = data.get("prompt", "").strip()
+        prompt, stripped = strip_frame(prompt)
 
         # Skip very short prompts — not enough signal for associator
+        # (порог ПОСЛЕ среза: уведомление без предметного summary молчит,
+        # а не печатает фон с уверенным видом)
         if len(prompt) < 8:
             print("{}", flush=True)
             return
@@ -58,15 +81,21 @@ def main() -> None:
 
         signal.alarm(0)  # cancel deadline
 
-        # Наблюдаемость: журнал выдач для оценки пользы слоя (вопрос Евгения 03.07)
+        # Наблюдаемость: журнал выдач для оценки пользы слоя (вопрос Евгения 03.07).
+        # Пишем то, что ВИДЕЛ associate (очищенный вход), не сырую обёртку:
+        # у уведомлений первые ~100 символов = одна рамка, и журнал прибора
+        # нельзя было поверить по нему же. Записи со срезанной рамкой несут stripped.
         try:
             import datetime
+            rec = {
+                "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                "prompt": prompt[:200],
+                "hits": [r["label"] for r in (results or [])],
+            }
+            if stripped:
+                rec["stripped"] = True
             with open(os.path.join(ASSOCIATOR_HOME, "assoc_log.jsonl"), "a") as lf:
-                lf.write(json.dumps({
-                    "ts": datetime.datetime.now().isoformat(timespec="seconds"),
-                    "prompt": prompt[:100],
-                    "hits": [r["label"] for r in (results or [])],
-                }, ensure_ascii=False) + "\n")
+                lf.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception:
             pass
 
@@ -89,9 +118,13 @@ def main() -> None:
             }
         }), flush=True)
 
-    except Exception:
-        # Any failure → silent pass; never block the user's turn
+    except Exception as e:
+        # Ход диалога хук не ломает (stdout пуст) — но и молчать о поломке не вправе:
+        # тишина ассоциатора неотличима от «памяти нечего сказать». Собственная
+        # типизация файла (шапка) требует «громко в stderr, тихо в stdout» — до сей
+        # правки except исполнял только вторую половину: норма жила комментарием.
         signal.alarm(0)
+        print(f"[ассоциатор] пропускаю ход: {type(e).__name__}: {e}", file=sys.stderr)
         print("{}", flush=True)
 
 
