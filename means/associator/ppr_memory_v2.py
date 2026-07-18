@@ -252,16 +252,25 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 def split_into_chunks(body: str) -> list[tuple[str, str]]:
     """
     Split body into (slug, text) pairs by ## or ### headings.
+    Bold node lines (**N3. / - **K25.) also open a chunk, but unlike headings
+    the line STAYS in the chunk text: an ontology map that refuses to duplicate
+    its corpus (anti-Funes) has no lexical mass of its own — the node title IS
+    the node's mass, dropping it would keep the map invisible to tf-idf.
     Falls back to paragraph chunking if no headings found.
     """
-    parts = re.split(r'\n(#{1,3} [^\n]+)', body)
+    parts = re.split(r'\n(#{1,3} [^\n]+|(?:- )?\*\*[NK]\d+\.[^\n]*)', body)
 
     chunks: list[tuple[str, str]] = []
     current_slug = "intro"
     current_text = ""
 
     for part in parts:
-        if re.match(r'^#{1,3} ', part):
+        if re.match(r'^(?:- )?\*\*[NK]\d+\.', part):
+            if current_text.strip() and token_count(current_text) >= MIN_CHUNK_TOKENS:
+                chunks.append((current_slug, current_text.strip()))
+            current_slug = re.match(r'^(?:- )?\*\*([NK]\d+)\.', part).group(1).lower()
+            current_text = part
+        elif re.match(r'^#{1,3} ', part):
             if current_text.strip() and token_count(current_text) >= MIN_CHUNK_TOKENS:
                 chunks.append((current_slug, current_text.strip()))
             heading = re.sub(r'^#{1,3} ', '', part).strip()
