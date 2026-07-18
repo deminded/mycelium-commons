@@ -32,16 +32,35 @@ ASSOCIATOR_HOME = os.environ.get("MYCELIUM_ASSOCIATOR_HOME")
 # Контракт тега — харнессный: у всякого форка на Claude Code рамка та же.
 _SUMMARY_RE = re.compile(r"<summary>(.*?)</summary>", re.DOTALL)
 
+# Рамка <channel> (канальные плагины Claude Code) — та же болезнь вторым слоем:
+# константа тега глушит вариацию-предмет (на живом корпусе автора канальный
+# псевдо-узел держал 0.964 запросов, на голом теле — 0.008). Конструкция ножа —
+# рамка не срезана, а НЕ ВЗЯТА: seed = тело тега. У моста tg-bridge внутри тела
+# ещё два константных слоя (шапка чата + «недавний контекст»): seed = блок
+# «Адресовано тебе:»; адресные строки остаются — в них цитата-предмет.
+# Контракт блока — не харнессный, а мостовой (bridge_poller): форкается вместе
+# с мостом; без моста ветка просто не находит своей формы и молчит.
+_CHANNEL_RE = re.compile(r"<channel([^>]*)>\n?(.*?)\n?</channel>", re.DOTALL)
+_ADDR_RE = re.compile(
+    r"Адресовано тебе:\n(.*?)(?:\n\s*— недавний контекст чата|\Z)", re.DOTALL
+)
+
 
 def strip_frame(prompt: str):
-    """Return (clean_text, was_stripped). Пустой summary → пустая строка:
-    молчание честнее уверенного фона от упаковки."""
-    if "<task-notification>" not in prompt:
-        return prompt, False
-    summaries = [s.strip() for s in _SUMMARY_RE.findall(prompt) if s.strip()]
-    if not summaries:
-        return "", True
-    return "\n".join(summaries), True
+    """Return (clean_text, frame) where frame is None | 'notification' |
+    'channel' | 'bridge'. Пустое содержание → пустая строка: молчание
+    честнее уверенного фона от упаковки (порог тишины — ПОСЛЕ среза)."""
+    if "<task-notification>" in prompt:
+        summaries = [s.strip() for s in _SUMMARY_RE.findall(prompt) if s.strip()]
+        return "\n".join(summaries), "notification"
+    m = _CHANNEL_RE.search(prompt)
+    if m:
+        attrs, body = m.group(1), m.group(2)
+        if "plugin:tg-bridge" in attrs:
+            a = _ADDR_RE.search(body)
+            return (a.group(1).strip() if a else body.strip()), "bridge"
+        return body.strip(), "channel"
+    return prompt, None
 
 
 def _handle_timeout(signum, frame):
@@ -55,7 +74,7 @@ def main() -> None:
 
         data = json.load(sys.stdin)
         prompt = data.get("prompt", "").strip()
-        prompt, stripped = strip_frame(prompt)
+        prompt, frame = strip_frame(prompt)
 
         # Skip very short prompts — not enough signal for associator
         # (порог ПОСЛЕ среза: уведомление без предметного summary молчит,
@@ -84,7 +103,9 @@ def main() -> None:
         # Наблюдаемость: журнал выдач для оценки пользы слоя (вопрос Евгения 03.07).
         # Пишем то, что ВИДЕЛ associate (очищенный вход), не сырую обёртку:
         # у уведомлений первые ~100 символов = одна рамка, и журнал прибора
-        # нельзя было поверить по нему же. Записи со срезанной рамкой несут stripped.
+        # нельзя было поверить по нему же. Записи со срезанной рамкой несут
+        # маркер тракта (frame): без него журнал не отвечает на вопрос
+        # «каким ножом был получен этот вход».
         try:
             import datetime
             rec = {
@@ -92,8 +113,8 @@ def main() -> None:
                 "prompt": prompt[:200],
                 "hits": [r["label"] for r in (results or [])],
             }
-            if stripped:
-                rec["stripped"] = True
+            if frame:
+                rec["frame"] = frame
             with open(os.path.join(ASSOCIATOR_HOME, "assoc_log.jsonl"), "a") as lf:
                 lf.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception:
