@@ -45,11 +45,19 @@ _ADDR_RE = re.compile(
     r"Адресовано тебе:\n(.*?)(?:\n\s*— недавний контекст чата|\Z)", re.DOTALL
 )
 
+# Контракт порождения (L5-ш35): рамки СВОИХ органов не догоняются перечнем
+# форм в ноже (стареет, ш33) — орган метит предмет <subj>…</subj> при
+# генерации, нож слепо берёт содержимое. Форкающему: если твои кроны шлют
+# оклики себе в сессию — мети предмет тем же тегом, иначе константная шапка
+# органа резонирует с узлами-о-своей-обвязке (ш34: 46% потока, ложный фон).
+_SUBJ_RE = re.compile(r"<subj>(.*?)</subj>", re.DOTALL)
+
 
 def strip_frame(prompt: str):
     """Return (clean_text, frame) where frame is None | 'notification' |
-    'channel' | 'bridge'. Пустое содержание → пустая строка: молчание
-    честнее уверенного фона от упаковки (порог тишины — ПОСЛЕ среза)."""
+    'channel' | 'bridge' | 'channel+subj' | 'bridge+subj'. Пустое содержание →
+    пустая строка: молчание честнее уверенного фона от упаковки (порог
+    тишины — ПОСЛЕ среза)."""
     if "<task-notification>" in prompt:
         summaries = [s.strip() for s in _SUMMARY_RE.findall(prompt) if s.strip()]
         return "\n".join(summaries), "notification"
@@ -58,8 +66,15 @@ def strip_frame(prompt: str):
         attrs, body = m.group(1), m.group(2)
         if "plugin:tg-bridge" in attrs:
             a = _ADDR_RE.search(body)
-            return (a.group(1).strip() if a else body.strip()), "bridge"
-        return body.strip(), "channel"
+            text, frame = (a.group(1).strip() if a else body.strip()), "bridge"
+        else:
+            text, frame = body.strip(), "channel"
+        subj = _SUBJ_RE.findall(text)
+        if subj:
+            # маркер есть, но пуст → пустой seed (тишина): орган сказал
+            # «предмета нет», падать к сырой рамке — вернуть ложный фон
+            return "\n".join(s.strip() for s in subj if s.strip()), frame + "+subj"
+        return text, frame
     return prompt, None
 
 
