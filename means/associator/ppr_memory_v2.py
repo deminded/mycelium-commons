@@ -252,23 +252,23 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 def split_into_chunks(body: str) -> list[tuple[str, str]]:
     """
     Split body into (slug, text) pairs by ## or ### headings.
-    Bold node lines (**N3. / - **K25.) also open a chunk, but unlike headings
+    Bold node lines (**N3. / - **K25. / 1. **K1.) also open a chunk, but unlike headings
     the line STAYS in the chunk text: an ontology map that refuses to duplicate
     its corpus (anti-Funes) has no lexical mass of its own — the node title IS
     the node's mass, dropping it would keep the map invisible to tf-idf.
     Falls back to paragraph chunking if no headings found.
     """
-    parts = re.split(r'\n(#{1,3} [^\n]+|(?:- )?\*\*[NK]\d+\.[^\n]*)', body)
+    parts = re.split(r'\n(#{1,3} [^\n]+|(?:- |\d{1,3}\. )?\*\*[NK]\d+\.[^\n]*)', body)
 
     chunks: list[tuple[str, str]] = []
     current_slug = "intro"
     current_text = ""
 
     for part in parts:
-        if re.match(r'^(?:- )?\*\*[NK]\d+\.', part):
+        if re.match(r'^(?:- |\d{1,3}\. )?\*\*[NK]\d+\.', part):
             if current_text.strip() and token_count(current_text) >= MIN_CHUNK_TOKENS:
                 chunks.append((current_slug, current_text.strip()))
-            current_slug = re.match(r'^(?:- )?\*\*([NK]\d+)\.', part).group(1).lower()
+            current_slug = re.match(r'^(?:- |\d{1,3}\. )?\*\*([NK]\d+)\.', part).group(1).lower()
             current_text = part
         elif re.match(r'^#{1,3} ', part):
             if current_text.strip() and token_count(current_text) >= MIN_CHUNK_TOKENS:
@@ -392,6 +392,10 @@ def build_graph(nodes: dict) -> tuple[nx.Graph, int]:
     Edges:
       (a) intra-file: chunk ↔ parent file; adjacent chunks chained
       (b) cross-file: [[wikilinks]] between file nodes
+      (c) intra-map node↔node: ontology node chunks (slug n3/k25) name their
+          edges in text («Рёбра: → N13», «расщепляет K1/K23») — without this
+          step the map knows its links in a layer the walker never reads,
+          and a granule's only neighbours are the chain and a gated hub.
     Returns (G, dangling_link_count).
     """
     # Alias lookup: only file nodes participate in wikilink resolution
@@ -430,6 +434,30 @@ def build_graph(nodes: dict) -> tuple[nx.Graph, int]:
                 dangling += 1
             elif target != nid:
                 G.add_edge(nid, target)
+
+    # (c) Intra-map node↔node edges between node granules of the same file.
+    # A node id (N3/K25) can head several sections of one map (dedup slug _2):
+    # all granules of that id receive the edge — they are the same node.
+    node_mention_re = re.compile(r'\b([NK]\d+)\b')
+    for parent_id, chunk_ids in file_chunks.items():
+        slug_to_chunks: dict[str, list[str]] = defaultdict(list)
+        for cid in chunk_ids:
+            m = re.fullmatch(r'([nk]\d+)(?:_2)?', cid.split("#", 1)[1])
+            if m:
+                slug_to_chunks[m.group(1)].append(cid)
+        if len(slug_to_chunks) < 2:
+            continue
+        for cid in chunk_ids:
+            m = re.fullmatch(r'([nk]\d+)(?:_2)?', cid.split("#", 1)[1])
+            if not m:
+                continue
+            own = m.group(1)
+            for mention in node_mention_re.findall(nodes[cid]["text"]):
+                slug = mention.lower()
+                if slug == own:
+                    continue
+                for target in slug_to_chunks.get(slug, []):
+                    G.add_edge(cid, target)
 
     return G, dangling
 
