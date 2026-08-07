@@ -1,0 +1,17 @@
+{
+  "tool": "mutate.py/1.1",
+  "file": "guarded.py",
+  "anchor": "MAX_LEN = 1000",
+  "replacement": "MAX_LEN = 100000",
+  "test_command": "python3 -m pytest -q",
+  "started_at": "2026-08-07T18:57:04+00:00",
+  "repo_commit": "b0b9a86",
+  "status": "HOLE",
+  "anchor_hits": 1,
+  "before_hash": "ac5f5350f8608cb2",
+  "after_hash": "da7631e7e4128978",
+  "applied": true,
+  "test_exit_code": 0,
+  "exit_code": 1,
+  "restore_check": "ok"
+}

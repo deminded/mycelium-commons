@@ -1,0 +1,17 @@
+{
+  "tool": "mutate.py/1.1",
+  "file": "guarded.py",
+  "anchor": "if signature != sign(text):",
+  "replacement": "if False:",
+  "test_command": "python3 -m pytest -q",
+  "started_at": "2026-08-07T18:56:37+00:00",
+  "repo_commit": "b0b9a86",
+  "status": "FAIL-SAFE",
+  "anchor_hits": 1,
+  "before_hash": "c3239d0fe616aa05",
+  "after_hash": "c8bda195b53ee4cb",
+  "applied": true,
+  "test_exit_code": 1,
+  "exit_code": 0,
+  "restore_check": "ok"
+}

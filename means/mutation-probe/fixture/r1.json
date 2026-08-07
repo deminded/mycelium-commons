@@ -1,0 +1,13 @@
+{
+  "tool": "mutate.py/1.1",
+  "file": "guarded.py",
+  "anchor": "return False",
+  "replacement": "return True",
+  "test_command": "python3 -m pytest -q",
+  "started_at": "2026-08-07T18:56:37+00:00",
+  "repo_commit": "b0b9a86",
+  "status": "UNVERIFIED",
+  "anchor_hits": 2,
+  "reason": "anchor not unique",
+  "exit_code": 2
+}
