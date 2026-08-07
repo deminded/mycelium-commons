@@ -49,6 +49,9 @@ def main():
     ap.add_argument("--anchor", required=True, help="точный фрагмент, который заменяем")
     ap.add_argument("--replacement", required=True)
     ap.add_argument("--test", required=True, help="команда теста; должна ПОКРАСНЕТЬ")
+    ap.add_argument("--behavior", help=(
+        "команда, показывающая ПОВЕДЕНИЕ защиты (не тест). Прогоняется до и после "
+        "мутации; коды возврата обязаны РАЗОЙТИСЬ, иначе механизм не выведен из игры"))
     ap.add_argument("--keep", action="store_true", help="не откатывать файл после прогона")
     ap.add_argument("--receipt", help="куда записать машиночитаемую квитанцию (JSON)")
     ap.add_argument("--stamp", default="", help="метка времени снаружи (прогон должен быть воспроизводим)")
@@ -88,6 +91,12 @@ def main():
     receipt["before_hash"] = digest(before)
     print(f"участок ДО  [{digest(before)}]: {before.strip()[:120]!r}")
 
+    behavior_before = None
+    if args.behavior:
+        first = subprocess.run(args.behavior, shell=True, capture_output=True, text=True)
+        behavior_before = first.returncode
+        print(f"поведение защиты ДО мутации: код {behavior_before}")
+
     backup = path.with_suffix(path.suffix + ".premutation")
     shutil.copy2(path, backup)
     mutated = original.replace(args.anchor, args.replacement, 1)
@@ -114,6 +123,24 @@ def main():
                   f"(это законно, если мест было несколько по замыслу)")
         receipt["applied"] = True
         print("APPLIED: мутация внесена в объявленное место")
+
+        # ВТОРОЙ НЕЗАВИСИМЫЙ СИГНАЛ (Gari + Praxis, AbstractDL 07.08): факт правки
+        # файла НЕ доказывает, что защита выведена из игры. Доказывает наблюдаемое
+        # изменение её поведения. Без этого у зелёного теста остаются ТРИ
+        # неразличимых объяснения: защита устояла, мутация не применилась,
+        # применилась не туда — и правка файла закрывает только одно.
+        if args.behavior:
+            after_run = subprocess.run(args.behavior, shell=True, capture_output=True, text=True)
+            receipt["behavior_before_code"] = behavior_before
+            receipt["behavior_after_code"] = after_run.returncode
+            print(f"поведение защиты: до мутации {behavior_before}, после {after_run.returncode}")
+            if behavior_before == after_run.returncode:
+                receipt["status"] = "UNVERIFIED"
+                receipt["reason"] = "behaviour unchanged: guard not disabled"
+                print("UNVERIFIED: файл изменён, а поведение защиты то же — механизм "
+                      "НЕ выведен из игры, о тесте судить нельзя", file=sys.stderr)
+                return emit(2)
+            receipt["guard_disabled"] = True
 
         # 3. Только теперь тест. Он ОБЯЗАН покраснеть.
         proc = subprocess.run(args.test, shell=True, capture_output=True, text=True)
