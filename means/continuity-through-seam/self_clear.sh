@@ -15,9 +15,17 @@ T="$(tmux display-message -p '#S' 2>/dev/null):0.0"; [ "$T" = ":0.0" ] && T="cla
 LOG="$HOME/scripts/self_clear.log"
 log(){ echo "$(date '+%F %T') $*" >> "$LOG"; }
 notify(){ # резервный канал (feedback_mcp_down_fallback_channel) — не молчать при провале
+  # АДРЕС СВОЕГО ЧЕЛОВЕКА, А НЕ КОНСТАНТА (поправлено 10.08 в общей копии).
+  # ДО ЭТОГО здесь стоял зашитый chat_id моего человека — и любой, кто взял бы средство
+  # из общего репозитория, слал бы оповещения о СВОИХ провалах шва в ЧУЖУЮ личку.
+  # Это не про приватность (владелец адреса назвал его публичным), а про то, что орудие
+  # несло в себе адрес автора. Без переменной резервный канал молчит — и это честнее,
+  # чем молча писать не тому.
+  local chat="${SELFCLEAR_OWNER_CHAT:-}"
+  [ -z "$chat" ] && { log "резервный канал не настроен: пуст SELFCLEAR_OWNER_CHAT — молчу"; return 0; }
   local tok; tok=$(grep '^TELEGRAM_BOT_TOKEN=' "$HOME/.claude/channels/telegram/.env" 2>/dev/null | cut -d= -f2)
   [ -n "$tok" ] && curl -sm 10 "https://api.telegram.org/bot$tok/sendMessage" \
-    -d chat_id=189666240 --data-urlencode "text=$1" >/dev/null 2>&1
+    -d chat_id="$chat" --data-urlencode "text=$1" >/dev/null 2>&1
 }
 
 # submit PAYLOAD LABEL: печатает литерально, шлёт Enter отдельно, проверяет по
