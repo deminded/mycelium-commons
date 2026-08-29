@@ -7,7 +7,7 @@ Cron (*/15): берёт самый свежий по mtime транскрипт 
 окликает сессию тем же intake-путём, что bridge_poller (HTTP POST на
 notifications/claude/channel).
 
-ЗАЧЕМ токены, а не размер файла (урок 15.07, tg-fd3ccb0e):
+ЗАЧЕМ токены, а не размер файла (урок 15.07, журнал 15.07):
 размер .jsonl НЕ коррелирует с переполнением. Эмпирика: сессия умерла от
 «Prompt is too long» на 8.5 MiB файла (контекст дорос до 976K токенов и
 следующий ход пробил 1M), тогда как другая сессия ЖИВА на 34.8 MiB —
@@ -19,9 +19,9 @@ notifications/claude/channel).
 ЗАЧЕМ отдельный скрипт, а не ветка в bridge_poller: у поллера queue-файл
 под его flock — чужая запись даёт гонку; POST-механизм переиспользуем.
 
-✅ 780K с 28.07 20:24 UTC — возвращён ДОСРОЧНО (Женя подрубил extra usage, «чего их
+✅ 780K с 28.07 20:24 UTC — возвращён ДОСРОЧНО (владелец подрубил extra usage, «чего их
 экономить»); временные 400K ради экономии прожили сутки. Порог живёт в файле, не тут
-(tg-8377). Причина числом, не на глаз: расход растёт КВАДРАТИЧНО с длиной окна,
+. Причина числом, не на глаз: расход растёт КВАДРАТИЧНО с длиной окна,
 потому что каждый ход перечитывает весь контекст. Замер 27.07: 894 хода × 412K
 = 368M прочитанного кэша; главная сессия — 96,8% всего расхода, все хартбиты
 вместе 3-5%. Резка окна вдвое даёт экономию вдвое (179M против 358M).
@@ -29,7 +29,7 @@ notifications/claude/channel).
 за семь сессий), ожидаемый рост до 9-10%. ЭТО НИЖНЯЯ ГРАНИЦА — прибор считает
 только ЗАМЕЧЕННУЮ потерю, незамеченное не в счёте (промис #97 меряет и его).
 ВЕРНУТЬ на 780K после сброса лимита 30.07 — промис #96, дата в каталоге.
-Прежняя запись (в силе после возврата): рабочая договорённость с Женей 27.07,
+Прежняя запись (в силе после возврата): рабочая договорённость с владельцем 27.07,
 окно 750–800K, не ждём, пока забьётся. Оклик на пороге
 даёт запас на связное сворачивание ВНУТРИ диапазона, а не на его границе.
 До 27.07 здесь стояло 850K: договорённость жила в разговоре, а прибор считал
@@ -37,7 +37,7 @@ notifications/claude/channel).
 Лимит модели из транскрипта структурно не читается (поле model без суффикса
 [1m]), поэтому порог задан абсолютом под 1M — дефолтную рабочую модель.
 
-ПОРОГ ЖИВЁТ СНАРУЖИ (28.07): /opt/anchor/thresholds.conf, владелец arete-anchor,
+ПОРОГ ЖИВЁТ СНАРУЖИ (28.07): /opt/anchor/thresholds.conf, владелец — отдельный uid (<anchor-owner>),
 мне только чтение. Менять его — не моя рука; в коде порога больше нет.
 
 Env: DRY_RUN=1 — печать вместо отправки; CTX_WATCH_THRESHOLD_TOKENS — порог
@@ -52,10 +52,14 @@ import time
 import urllib.request
 from collections import deque
 
-PROJECTS_DIR = "/home/claude-user/.claude/projects/-home-claude-user"
-STATE_FILE = "/home/claude-user/scripts/.context_watch_state.json"
-RUNTIME_PORT_FILE = "/home/claude-user/.arete_tg_bridge_channel_port"
-CHANNEL_ENV = "/home/claude-user/arete-bridge/tg-bridge-plugin/.env"
+# Playbook edition: paths come from env so the script is portable between agents.
+# PROJECT_SLUG = Claude Code's project dir name for the agent's cwd (e.g. "-home-alice").
+AGENT_HOME = os.environ.get("AGENT_HOME", os.path.expanduser("~"))
+PROJECT_SLUG = os.environ.get("PROJECT_SLUG", "-" + AGENT_HOME.strip("/").replace("/", "-"))
+PROJECTS_DIR = os.path.join(AGENT_HOME, ".claude/projects", PROJECT_SLUG)
+STATE_FILE = os.path.join(AGENT_HOME, "scripts/.context_watch_state.json")
+RUNTIME_PORT_FILE = os.path.join(AGENT_HOME, ".intake_channel_port")   # rendezvous file with intake port
+CHANNEL_ENV = os.environ.get("INTAKE_ENV", os.path.join(AGENT_HOME, "intake-plugin/.env"))  # holds INTAKE secret
 CHANNEL_PORT_DEFAULT = "8960"
 
 ANCHOR_THRESHOLDS = "/opt/anchor/thresholds.conf"
@@ -63,11 +67,10 @@ FALLBACK_TOKENS = 300000  # строже обоих рабочих значен�
 
 
 def _threshold_from_anchor():
-    """Порог живёт ВНЕ моей досягаемости: /opt/anchor принадлежит arete-anchor,
+    """Порог живёт ВНЕ моей досягаемости: /opt/anchor принадлежит отдельному uid,
     писать туда я не могу (проверено отказом прав 28.07).
 
-    ЗАЧЕМ так: прибор, чей порог я правлю сам, — мнение, а не датчик (класс от
-    Жени, Ouroboros 18494). Прежний источник — env CTX_WATCH_THRESHOLD_TOKENS —
+    ЗАЧЕМ так: прибор, чей порог я правлю сам, — мнение, а не датчик (класс, названный владельцем). Прежний источник — env CTX_WATCH_THRESHOLD_TOKENS —
     был лазейкой: одна строка в кроне возвращала рычаг мне в руку, поэтому как
     боевой источник он убран и остался только для DRY-прогонов.
 
@@ -198,10 +201,10 @@ def _send(text):
     now_ms = int(time.time() * 1000)
     body = json.dumps({
         "chat_id": "0",
-        "chat_title": "Страж контекста (системный орган)",
+        "chat_title": "Context watch (system organ)",
         "messages": [{
             "message_id": now_ms,
-            "user": "⚙ страж контекста",
+            "user": "⚙ context-watch",
             "text": text,
             "reply_to": None,
             "thread_id": None,
@@ -284,8 +287,16 @@ def main():
                 f"(~{pct:.0f}% от 1M, порог {THRESHOLD_TOKENS/1000:.0f}K), "
                 f"файл {os.path.basename(path)}. Пора осознанно сбросить: "
                 f"/clear с hand-off или /compress, пока есть запас ходов.")
+    # ИСТОЧНИК ПОРОГА В САМ ОКЛИК (08.08). Код источник знал (THRESHOLD_SRC) и печатал
+    # его в stderr, но до получателя доходило одно число: 300K по решению владельца и
+    # 300K из-за отказа чтения якоря выглядели одинаково. Решение принимается по окрику,
+    # а не по логу крона, — значит различение обязано быть в окрике.
+    src_note = f" Источник порога: {THRESHOLD_SRC}."
+    if THRESHOLD_SRC.startswith("fallback"):
+        src_note += (f" 🔴 Это ЗАПАСНОЕ значение (строже рабочего): якорь "
+                     f"{ANCHOR_THRESHOLDS} не прочитан. Не выбор владельца, а отказ чтения.")
     # <subj></subj> пуст: порог/токены — константа статуса, не предмет (контракт L5-ш36)
-    text = head + " Это системный оклик самому себе — в Telegram не отвечать.<subj></subj>"
+    text = head + src_note + " Это системный оклик самому себе — в Telegram не отвечать.<subj></subj>"
     if note:
         text += " " + note
 
@@ -306,7 +317,7 @@ def main():
 
 if __name__ == "__main__":
     main()
-    # ЗАЧЕМ метка (обход по форме 25.07, щуп Клодетты «где ещё я меряю то, чем сам являюсь»):
+    # ЗАЧЕМ метка (обход по форме 25.07, щуп соседнего агента «где ещё я меряю то, чем сам являюсь»):
     # страж контекста писал лог ТОЛЬКО когда шлёт оклик — то есть его молчание при штатной
     # работе неотличимо от его смерти. А умри он тихо, я узнаю об этом, лишь переполнив окно,
     # то есть ровно тогда, когда узнавать поздно. Метка ставится каждый прогон.

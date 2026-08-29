@@ -1,0 +1,28 @@
+/home/claude-user/handoff-playbook/scripts/arete_session.sh:10:  "$@"
+/home/claude-user/handoff-playbook/scripts/arete_supervisor.sh:26:  local t; t=$(grep '^TELEGRAM_BOT_TOKEN=' "${ALERT_BOT_ENV:-$H/.secrets/alert-bot.env}" | cut -d= -f2)
+/home/claude-user/handoff-playbook/scripts/self_clear.sh:18:  local tok; tok=$(grep '^TELEGRAM_BOT_TOKEN=' "${ALERT_BOT_ENV:-$HOME/.secrets/alert-bot.env}" 2>/dev/null | cut -d= -f2)
+/home/claude-user/handoff-playbook/scripts/context_watch.py:62:CHANNEL_ENV = os.environ.get("INTAKE_ENV", os.path.join(AGENT_HOME, "intake-plugin/.env"))  # holds INTAKE secret
+/home/claude-user/handoff-playbook/scripts/context_watch.py:132:def _context_tokens(path):
+/home/claude-user/handoff-playbook/scripts/context_watch.py:136:    (tokens, is_overflow, reason): is_overflow=True, если хвост уже <synthetic>
+/home/claude-user/handoff-playbook/scripts/context_watch.py:173:            tok = (u.get("input_tokens", 0)
+/home/claude-user/handoff-playbook/scripts/context_watch.py:174:                   + u.get("cache_read_input_tokens", 0)
+/home/claude-user/handoff-playbook/scripts/context_watch.py:175:                   + u.get("cache_creation_input_tokens", 0))
+/home/claude-user/handoff-playbook/scripts/context_watch.py:200:    secret = _read_env(CHANNEL_ENV, "TG_BRIDGE_INTAKE_SECRET") or ""
+/home/claude-user/handoff-playbook/scripts/context_watch.py:218:                 "X-TG-Bridge-Secret": secret})
+/home/claude-user/handoff-playbook/scripts/context_watch.py:227:    tokens, overflow, reason = _context_tokens(path)
+/home/claude-user/handoff-playbook/scripts/context_watch.py:228:    if tokens is None:
+/home/claude-user/handoff-playbook/scripts/context_watch.py:230:    k = tokens / 1000
+/home/claude-user/handoff-playbook/scripts/context_watch.py:231:    if tokens < THRESHOLD_TOKENS and not overflow:
+/home/claude-user/handoff-playbook/scripts/context_watch.py:244:    if state.get("file") == path and tokens < state.get("tokens", 0) + REGROWTH_TOKENS:
+/home/claude-user/handoff-playbook/scripts/context_watch.py:247:                  f"({tokens} vs {state.get('tokens')}) — тихо")
+/home/claude-user/handoff-playbook/scripts/context_watch.py:257:    # его ловит ветка tokens >= порог ниже.
+/home/claude-user/handoff-playbook/scripts/context_watch.py:271:    elif overflow and tokens < THRESHOLD_TOKENS:
+/home/claude-user/handoff-playbook/scripts/context_watch.py:285:        pct = tokens * 100 / 1000000
+/home/claude-user/handoff-playbook/scripts/context_watch.py:315:    _save_state({"ts": now, "tokens": tokens, "file": path})
+
+# Разбор совпадений (grep -nE 'sk-|token|api_key|secret|@|[0-9]{9,}|deminded|Евген|Женя|Ruslan|Клодетт|mycelium|Грибниц' scripts/*):
+# - arete_session.sh:10  "$@"                       — shell-синтаксис, не адрес
+# - *_supervisor.sh:26, self_clear.sh:18  TELEGRAM_BOT_TOKEN= — ИМЯ переменной, значение читается из env-файла (ALERT_BOT_ENV), в скрипте не лежит
+# - context_watch.py:62,200,218  secret / X-TG-Bridge-Secret — имя ключа и HTTP-заголовка; значение читается из INTAKE_ENV
+# - context_watch.py: tokens/_tokens/TOKENS           — токены как единица измерения контекста
+# Значений секретов, chat_id, телефонов, e-mail, имён людей и чатов в scripts/ нет.

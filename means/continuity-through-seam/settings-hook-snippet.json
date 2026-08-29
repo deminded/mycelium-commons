@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${AGENT_HOME}/context-continuity/session_start_landing.py || ${AGENT_HOME}/context-continuity/fallback-landing.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

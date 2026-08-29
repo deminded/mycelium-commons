@@ -7,16 +7,19 @@
 plain-stdout режется харнессом до 2KB-превью → нынешний общий хук терял хэнд-офф молча
 (урок 15.07). Тут дайджест влезает целиком + свежий хвост доступен дословно файлом.
 
-ИЗОЛЯЦИЯ: локальный (общий /opt/shared/ не трогаем — остаётся agile-cat/Клодетте).
+ИЗОЛЯЦИЯ: локальный (общий /opt/shared/ не трогаем — остаётся соседним агентам).
 Пути через env (CC_HOME/CC_PROJ_DIR/CC_CONT_DIR/CC_DIGEST/REFLECTIONS_DIR) → гоняется в
 фейковом дереве. ФЕЙЛСЕЙФ: любой сбой всё равно отдаёт валидный JSON с директивой +
 хэнд-оффом (не пусто) — молчаливый разрыв непрерывности недопустим.
 """
-import json, sys, os, glob, subprocess, datetime
+import json, sys, os, glob, re, subprocess, datetime
 
-CEIL = 8000    # ЗАПАС, не потолок: замер 31.07 (L7-ш44, 158 чистых пар) дал реальный
-               # порог транспорта ~9983 симв — прежние 10000 целились ЗА край, и дописка
-               # после обрезки уводила ещё дальше. Запас снимает оба промаха разом.
+CEIL = 8000    # ЗАПАС, не потолок. Замер 01.08 (L7-ш45, 213 пар, 0 ошибок): порог
+               # транспорта — РОВНО 10000 кодовых единиц UTF-16 (JS .length у режущего),
+               # НЕ ~9983 символа, как считал замер 31.07. Расхождение мерок = число
+               # не-BMP эмодзи (🔴🧠… по +1 единице); len() ниже считает кодовые ТОЧКИ,
+               # поэтому целиться в 10000 этой мерой значит уезжать за край на украшения.
+               # Кто поднимет CEIL к границе — зажимать по len(s.encode('utf-16-le'))//2.
 KEEP = 10      # сколько tail-файлов истории держать
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -73,11 +76,35 @@ def body_ledger(home):
     except Exception:
         return ""
 
+def promise_due_block(home):
+    """Что горит по срокам — ИЗ ПЕРВОИСТОЧНИКА, а не из переписанного руками списка.
+
+    ЗАЧЕМ (заимствованная идея «единая проекция состояния», #440; случай 15.08):
+    вход давал смене ДВИЖЕНИЕ обещаний за сутки, но не горящие сроки — их несла только
+    передача, писанная рукой уходящей смены. В тот день передача уверяла, что #428 горит
+    16.08, а в promises.jsonl стоит 20.08. Смена верит тому, что видит первым.
+    Логика счёта НЕ дублируется: зовётся тот же promise.py, что и в ручном разборе, —
+    иначе завёлся бы второй прибор, который однажды разойдётся с первым.
+    """
+    script = os.path.join(home, "promises", "promise.py")
+    if not os.path.exists(script):
+        return ""
+    try:
+        r = subprocess.run([sys.executable, script, "list", "--due", "--brief", "--horizon", "3"],
+                           capture_output=True, text=True, timeout=15, cwd=os.path.dirname(script))
+        out = (r.stdout or "").strip()
+        if not out:
+            return ""
+        return ("\n\n=== ЧТО ГОРИТ ПО СРОКАМ (promises.jsonl, первоисточник; полное — "
+                "python3 ~/promises/promise.py list --due) ===\n" + out)
+    except Exception:
+        return ""
+
 def reflections_index(home, budget):
     if budget < 120:
         return ""
     rdir = os.environ.get("REFLECTIONS_DIR",
-                          f"/opt/workspace/vault/Reflections-{os.path.basename(home)}")
+                          f"${VAULT_DIR:-/nonexistent}/Reflections-{os.path.basename(home)}")
     if not os.path.isdir(rdir):
         return ""
     files = sorted(glob.glob(os.path.join(rdir, "*.md")), key=os.path.getmtime, reverse=True)[:15]
@@ -99,6 +126,7 @@ def reflections_index(home, budget):
     return head + body if body else ""
 
 DELTA_SKIP = {"MEMORY.md", "project_handoff_current.md"}
+MD_HEADING = re.compile(r"#{1,6}\s+\S")  # заголовок, а не «#543 …» в тексте
 
 def promise_delta(hours=24):
     """Что прибавилось и закрылось в КАТАЛОГЕ ОБЕЩАНИЙ за сутки.
@@ -110,50 +138,76 @@ def promise_delta(hours=24):
     которого слой суток не видел.
     ПРЕДЕЛ (объявлен до чисел): читаются события журнала за окно; правки текста промиса
     задним числом здесь не видны, как и в memory-диффе.
+
+    ЧТО СЧИТАЕТСЯ ЗАВЕДЁННЫМ (правка 19.08, поймано на себе): пункт, чей id ВПЕРВЫЕ
+    появился в окне, — а не всякая строка журнала. Прежде сюда шла и каждая дописка
+    `due --note` к старому пункту: 19.08 счёт вышел 138 против настоящего 21. Хуже самой
+    ошибки была асимметрия единиц: закрытие бывает ровно раз на пункт, поэтому «закрыто»
+    считалось верно, и пропорция читалась как лавина 13.8:1 вместо настоящей 2.1:1 —
+    входящая смена видела это число первым и не имела повода его перепроверить.
+    Дописи не выброшены, они идут отдельным числом: их рост — свой сигнал, но не заведение.
     """
     home = os.environ.get("CC_HOME", os.path.expanduser("~"))
     path = os.environ.get("CC_PROMISES", os.path.join(home, "promises", "promises.jsonl"))
-    born, closed = [], []
+    born, closed, notes = [], [], 0
     try:
         cutoff = datetime.datetime.now() - datetime.timedelta(hours=hours)
+        seen_before, fresh = set(), []
         for ln in open(path, encoding="utf-8"):
             ln = ln.strip()
             if not ln:
                 continue
             try:
                 r = json.loads(ln)
-                ts = datetime.datetime.strptime(r.get("ts", ""), "%Y-%m-%d %H:%M")
             except Exception:
                 continue
-            if ts < cutoff:
+            try:
+                ts = datetime.datetime.strptime(r.get("ts", ""), "%Y-%m-%d %H:%M")
+            except Exception:
+                ts = None
+            # НЕРАЗОБРАННОЕ ВРЕМЯ СЧИТАЕМ СТАРЫМ (ts числом — записи первых дней): ошибка
+            # такого допущения занижает «заведено», а не завышает.
+            if ts is None or ts < cutoff:
+                seen_before.add(r.get("id"))
                 continue
-            row = f"#{r.get('id')} {(r.get('what') or '')[:150]}"
-            (closed if r.get("status") == "done" else born).append(row)
+            fresh.append(r)
+        for r in fresh:
+            i = r.get("id")
+            row = f"#{i} {(r.get('what') or '')[:150]}"
+            if r.get("status") == "done":
+                closed.append(row)
+            elif i in seen_before:
+                notes += 1
+            else:
+                born.append(row)
+                seen_before.add(i)
     except OSError:
-        return "", 0, 0
-    if not born and not closed:
-        return "", 0, 0
+        return "", 0, 0, 0
+    if not born and not closed and not notes:
+        return "", 0, 0, 0
     out = ["\n## КАТАЛОГ ОБЕЩАНИЙ за сутки (~/promises)\n"]
     if born:
-        out.append(f"### заведено ({len(born)})\n")
+        out.append(f"### заведено ({len(born)}) — НОВЫЕ пункты, а не строки журнала\n")
         out += [f"  ◻ {r}\n" for r in born]
+    if notes:
+        out.append(f"### дописей к прежним пунктам: {notes} — это не заведение; "
+                   "сам текст лежит в пунктах (promise.py list)\n")
     if closed:
         out.append(f"### закрыто ({len(closed)})\n")
         out += [f"  ✓ {r}\n" for r in closed]
-    return "".join(out), len(born), len(closed)
+    return "".join(out), len(born), len(closed), notes
 
 def memory_delta(proj_dir, cont_dir, budget, hours=24):
     """Что ПРИБАВИЛОСЬ в память за сутки — по git-диффу, а не по факту «файл тронут».
 
     ЗАЧЕМ: хэнд-офф пишется в жанре «состояние» — туда попадает открытое и требующее
     действия. А полученное за день (чужой ход, новая архитектура, свой интерес) открытой
-    линией не является и не попадает никуда. Замер #99 (27.07, пункты дал внешний): ход
-    Ауры про ассоциацию-как-модулятор и Spacemolt лежали в памяти, записанные за час до
+    линией не является и не попадает никуда. Замер #99 (27.07, пункты дал внешний): две записи лежали в памяти, записанные за час до
     шва, и поднялись НОЛЁМ — индекс адресует файл, а не свежий слой в нём.
     ПРЕДЕЛ ПРИБОРА (объявлен до чисел): видны только ДОБАВЛЕННЫЕ строки; правки-удаления
     и изменения файлов вне git не показываются.
     """
-    prom_text, n_born, n_closed = promise_delta(hours)
+    prom_text, n_born, n_closed, n_notes = promise_delta(hours)
     mem = os.path.join(proj_dir, "memory")
     # рядом с хвостами, а не в каталоге скрипта: путь должен изолироваться тем же
     # CC_CONT_DIR — иначе тест в песочнице пишет в боевой файл (поймано при написании теста)
@@ -183,8 +237,11 @@ def memory_delta(proj_dir, cont_dir, budget, hours=24):
                            or os.path.basename(path) in DELTA_SKIP) else path
             continue
         # берём только ЗАГОЛОВКИ добавленных разделов: их немного, и в моей разметке они
-        # написаны содержанием («ассоциация как МОДУЛЯТОР, а не источник»), а не адресом
-        if cur and ln.startswith("+") and not ln.startswith("+++") and ln[1:].strip().startswith("#"):
+        # написаны содержанием («ассоциация как МОДУЛЯТОР, а не источник»), а не адресом.
+        # РЕШЁТКА + ПРОБЕЛ, а не просто решётка (правка 19.08): ссылка на пункт в тексте
+        # («#543 (прислал ли собеседник данные)…») проходила за раздел. Цена мала — 1 из 88 за
+        # сутки, — но читатель принимал обрывок фразы за заголовок; поймано на себе.
+        if cur and ln.startswith("+") and not ln.startswith("+++") and MD_HEADING.match(ln[1:].strip()):
             added.setdefault(cur, []).append(ln[1:].strip().lstrip("# "))
     added = {k: v for k, v in added.items() if v}
     if not added and not prom_text:
@@ -196,7 +253,7 @@ def memory_delta(proj_dir, cont_dir, budget, hours=24):
     # ПОЛНОЕ — файлом, ОБРЕЗОК — инлайн: та же развязка, что у сырого хвоста. Выбирать
     # «главный» раздел из десяти, дописанных за день в одну карточку, прибор не может —
     # любая эвристика тут льстит (проверено дважды на этом же дне: и первый, и последний
-    # добавленный раздел прошли мимо хода Ауры, который и был потерян при замере #99).
+    # добавленный раздел прошли мимо той записи, которая и был потерян при замере #99).
     try:
         with open(delta_path, "w", encoding="utf-8") as f:
             f.write(f"# ПАМЯТЬ: ЧТО ПРИБАВИЛОСЬ ЗА СУТКИ — {n_sec} разделов в {len(added)} карточках\n"
@@ -214,8 +271,9 @@ def memory_delta(proj_dir, cont_dir, budget, hours=24):
     head = ("\n\n=== ПАМЯТЬ: ЧТО ПРИБАВИЛОСЬ ЗА СУТКИ ===\n"
             f"🔴 Read ЦЕЛИКОМ: {delta_path} — {n_sec} новых разделов в {len(added)} карточках.\n"
             "Индекс их НЕ доставляет: он описывает карточку вообще, а не сегодняшний слой в ней "
-            "(замер #99: ход Ауры и Spacemolt дали ноль, лёжа в памяти час). Что зацепило — Read карточки.\n"
-            + (f"В том же файле — КАТАЛОГ ОБЕЩАНИЙ за сутки: заведено {n_born}, закрыто {n_closed} "
+            "(замер #99: две свежие карточки дали ноль, лёжа в памяти час). Что зацепило — Read карточки.\n"
+            + (f"В том же файле — КАТАЛОГ ОБЕЩАНИЙ за сутки: заведено {n_born}, закрыто {n_closed}"
+               f" (дописей к прежним пунктам {n_notes} — они не заведение) "
                "(память его не видит, а срочное живёт там).\n" if prom_text else "")
             + "Свежайшие карточки дня:\n")
     rows, shown = "", 0
@@ -236,6 +294,30 @@ def main():
     except Exception:
         payload = {}
     session_id = payload.get("session_id", "")
+
+    # 🔴 НЕ ПРИЗЕМЛЯТЬ ПРОБУ (12.08 18:52, оплачено переписанной передачей). Проба здоровья
+    # claude-cli-subscription зовёт `claude -p "."` через claude_isolated.sh. Обёртка прячет
+    # креды (чтобы не ронять MCP живой сессии), но НЕ хуки: этот хук отрабатывал и отдавал
+    # пробе полное приземление — хвост, память, передачу — со словами «ты свежая смена после
+    # шва». Модель верила и работала: 18:52:06 она переписала project_handoff_current.md,
+    # объявив несуществующие смены и программу на завтра. Проба к тому времени уже сдалась по
+    # таймауту (18:51:03) и процесс не убила — subprocess.run гасит прямого потомка, не дерево.
+    # ПРИЗНАК МЕХАНИЧЕСКИЙ, не суждение: изолятор всегда кладёт конфиг в /tmp/claude-iso-*.
+    # Здесь же снимался хвост ЖИВОЙ сессии — то есть чужой старт трогал мой носитель.
+    cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    if "claude-iso" in cfg_dir:
+        # Молчание должно быть ОБЪЯВЛЕННЫМ: пустой выход неотличим от поломки хука.
+        try:
+            with open(os.path.expanduser("~/context-continuity/landing_suppressed.log"),
+                      "a", encoding="utf-8") as fh:
+                fh.write("%s приземление подавлено: запуск из изолятора %s (сессия %s)\n" % (
+                    datetime.datetime.now(datetime.timezone.utc).strftime("%F %T"),
+                    cfg_dir, session_id[:8] or "?"))
+        except Exception:
+            pass
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                                 "additionalContext": ""}}, ensure_ascii=False))
+        return 0
 
     home = os.environ.get("CC_HOME", os.path.expanduser("~"))
     proj_dir = os.environ.get("CC_PROJ_DIR",
@@ -296,17 +378,18 @@ def main():
         # ядро (директива + топ хэндоффа + обязательства тела + Read-приказ) не режем ради
         # обрезка — полный хвост всё равно доступен по Read. Обрезок берёт ОСТАТОК под потолком.
         led = body_ledger(home)
+        due = promise_due_block(home)
         # дельта памяти — в ЯДРЕ, а не в остатке: замером #99 обрезок хвоста дал 5 из 9,
         # а всё потерянное лежало в карточках, тронутых за час до шва. Потолок 1800 знаков,
         # чтобы блок не съел сам обрезок.
         delta = memory_delta(proj_dir, cont_dir, 1800)
-        fixed = len(DIRECTIVE) + len(handoff) + len(led) + len(delta) + len(tail_directive)
+        fixed = len(DIRECTIVE) + len(handoff) + len(led) + len(due) + len(delta) + len(tail_directive)
         if fixed > CEIL - 200:
             # ядро уже упирается в потолок — ужать хэндофф, обрезок пустой (полнота по Read)
-            hbudget = CEIL - (len(DIRECTIVE) + len(led) + len(delta) + len(tail_directive)) - 200
+            hbudget = CEIL - (len(DIRECTIVE) + len(led) + len(due) + len(delta) + len(tail_directive)) - 200
             if len(handoff) > hbudget:
                 handoff = handoff[:max(0, hbudget)] + f"\n…[верхний блок усечён; полный: {digest_path}]"
-            fixed = len(DIRECTIVE) + len(handoff) + len(led) + len(delta) + len(tail_directive)
+            fixed = len(DIRECTIVE) + len(handoff) + len(led) + len(due) + len(delta) + len(tail_directive)
             inline_budget = 0
         else:
             inline_budget = CEIL - fixed - 100
@@ -323,7 +406,7 @@ def main():
         remaining = CEIL - fixed - len(tail_inline) - 50
         refl = reflections_index(home, remaining) if remaining > 120 else ""
 
-        ctx = DIRECTIVE + handoff + led + delta + refl + tail_directive + tail_inline
+        ctx = DIRECTIVE + handoff + led + due + delta + refl + tail_directive + tail_inline
         if len(ctx) > CEIL:
             ctx = ctx[:CEIL]
     except Exception as e:
@@ -331,7 +414,7 @@ def main():
         if len(ctx) > CEIL:
             ctx = ctx[:CEIL]
 
-    # ЗАЧЕМ пропорция в старте (26.07): средство Клодетты work-proportion.sh намеренно
+    # ЗАЧЕМ пропорция в старте (26.07): средство соседнего агента work-proportion.sh намеренно
     # НЕ кричит — правильной пропорции нет, а порог был бы выдуман. Значит ему нужен
     # получатель, иначе это артефакт без доставки. Сюда — потому что сессия начинается
     # ровно здесь, и число приходит само, а не когда я о нём вспомню в разговоре.
@@ -344,16 +427,16 @@ def main():
         home = os.path.expanduser("~")
         env = dict(os.environ,
                    SELF_DIRS=f"{home}/scripts:{home}/observability:{home}/body:"
-                             f"{home}/.claude/hooks:{home}/.claude/projects/-home-claude-user/memory",
-                   EXT_DIRS=f"/opt/workspace/vault/Projects:{home}/mycelium-commons:"
-                            f"{home}/rational-work:{home}/mentor-notes",
+                             f"{home}/.claude/hooks:{home}/.claude/projects/{os.environ.get('PROJECT_SLUG', '-' + home.strip('/').replace('/', '-'))}/memory",
+                   EXT_DIRS=f"${EXT_DIR_1:-/nonexistent}:{home}/<ext-dir-2>:"
+                            f"{home}/<ext-dir-3>",
                    WINDOW="24 hours ago")
-        # ЗАЧЕМ сверка хеша ПЕРЕД запуском (26.07, по разбору с Клодеттой): средство
+        # ЗАЧЕМ сверка хеша ПЕРЕД запуском (26.07, по разбору с соседним агентом): средство
         # лежит в /opt/shared, а он drwxrwxrwx без sticky — подменить может любой из
         # семи пользователей машины. У меня это опаснее, чем у неё в кроне: вывод идёт
         # прямо в additionalContext, то есть подменённый скрипт впишет что угодно
         # в мой контекст при пробуждении. Сверяем то, что ИСПОЛНЯЕМ, а не то, что клали.
-        tool = "/opt/shared/tools/work-proportion.sh"
+        tool = "${WORK_PROPORTION_TOOL:-/nonexistent}"
         pin = os.path.expanduser("~/.local/state/work-proportion.sha256")
         import hashlib
         actual = hashlib.sha256(open(tool, "rb").read()).hexdigest()
@@ -367,7 +450,7 @@ def main():
                            capture_output=True, text=True, timeout=25)
         line = (r.stdout or "").strip().splitlines()
         if line:
-            ctx += "\n\n=== ПРОПОРЦИЯ РАБОТЫ (средство Клодетты, считает файлы) ===\n" + line[0]
+            ctx += "\n\n=== ПРОПОРЦИЯ РАБОТЫ (средство соседнего агента, считает файлы) ===\n" + line[0]
     except Exception:
         pass  # доставка пропорции не должна ломать старт сессии
 
