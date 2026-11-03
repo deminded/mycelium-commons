@@ -118,6 +118,19 @@ def safe_name(name):
     return name[:80] or "file"
 
 
+def accepted_formats_hint():
+    # Why: a bare reject left a sender guessing for 14 h what would pass (8962 -> 8965,
+    # 03.11.2026). The list comes from the gate's own whitelist so the hint cannot drift
+    # from the policy; on any import trouble the reject still goes out, just without it.
+    try:
+        import file_safety_check as fsc
+        kinds = [p + "*" if p.endswith("/") else p for p in fsc.MIME_WHITELIST_PREFIXES]
+        kinds += sorted(fsc.MIME_WHITELIST_EXACT)
+        return " Принимаются: " + ", ".join(kinds) + "."
+    except Exception:
+        return ""
+
+
 def sanitize_for_chat(text, limit=300):
     """Any attacker-influenced string headed for a Telegram reply passes through
     here. Two of its sources — a triage summary and a static_reason like
@@ -213,9 +226,11 @@ def handle_file(msg):
             os.remove(dest)
         except OSError:
             pass
+        hint = accepted_formats_hint() if any(
+            r.startswith("mime_not_whitelisted") for r in reasons) else ""
         reply(chat_id,
               f"🛑 reject: {sanitize_for_chat(why)}. Файл в оборот узла не принят "
-              f"(метка и журнал сохранены).",
+              f"(метка и журнал сохранены).{hint}",
               reply_to=msg_id, thread_id=thread_id)
     else:
         qdest = os.path.join(QUARANTINE, os.path.basename(dest))
