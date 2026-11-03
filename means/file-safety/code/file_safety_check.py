@@ -22,8 +22,10 @@ redirect what gets scanned nor attach our verdict to a different file.
 
 import errno
 import hashlib
+import html
 import json
 import os
+import re
 import shutil
 import stat as stat_mod
 import subprocess
@@ -45,7 +47,13 @@ MIME_WHITELIST_PREFIXES = (
     "image/gif",
     "image/webp",
 )
+# Word .docx (OOXML) — admitted 03.11.2026 at the node owner's request (Грибница 8971).
+# It is a zip container: listed in ARCHIVE_MIME_TYPES too (bomb quotas apply, the
+# "zip inside a non-zip" polyglot rule does not) and it must also pass ooxml_check().
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
 MIME_WHITELIST_EXACT = {
+    DOCX_MIME,
     "application/pdf",
     "application/json",
     "application/zip",
@@ -63,7 +71,33 @@ ZIP_MAX_FILE_COUNT = 10_000
 ZIP_MAX_UNCOMPRESSED_BYTES = 500 * 1024 * 1024
 ZIP_MAX_NESTED_DEPTH = 15    # path separators inside the archive as a depth proxy
 
-ARCHIVE_MIME_TYPES = {"application/zip"}
+ARCHIVE_MIME_TYPES = {"application/zip", DOCX_MIME}
+
+# .docx content rules. A document may point outside itself only by hyperlink: a link
+# fires on a click. Any other external relationship (attachedTemplate, frame, a picture
+# linked by URL...) makes Word fetch remote content on open — the remote-template channel.
+OOXML_EXTERNAL_REL_ALLOWED = ("/hyperlink",)
+# Relationship types that carry code or opaque objects even when the target is internal
+# (an OLE blob can sit at any path, so the directory rule alone is not enough).
+OOXML_ACTIVE_REL_TYPES = ("/oleobject", "/package", "/control", "/activexcontrolbinary",
+                          "/vbaproject", "/afchunk", "/subdocument")
+OOXML_ACTIVE_PARTS = ("vbaproject.bin", "vbadata.xml")
+OOXML_ACTIVE_DIRS = ("/embeddings/", "/activex/")
+# Field codes that pull or run something external when the document opens or updates.
+OOXML_ACTIVE_FIELDS = ("DDE", "DDEAUTO", "INCLUDETEXT", "INCLUDEPICTURE", "LINK", "IMPORT")
+OOXML_PART_READ_CAP = 20 * 1024 * 1024
+
+# Any namespace prefix (or none): Word accepts the WordprocessingML namespace bound to
+# any prefix, so matching the literal "w:" would let a renamed prefix walk past.
+_NS = r"(?:[\w.-]+:)?"
+_RE_REL = re.compile(r"<" + _NS + r"Relationship\b[^>]*>", re.S)
+_RE_FIELD_TOKENS = re.compile(
+    r"<" + _NS + r"fldChar\b[^>]*?" + _NS + r"fldCharType\s*=\s*[\"'](begin|separate|end)[\"']"
+    # (?<!/) — a self-closing <instrText/> must not open a span that swallows the
+    # next field up to some later </instrText> and glues two codes into one.
+    r"|<" + _NS + r"instrText\b[^>]*(?<!/)>(.*?)</" + _NS + r"instrText\s*>"
+    r"|<" + _NS + r"fldSimple\b[^>]*?" + _NS + r"instr\s*=\s*(?:\"([^\"]*)\"|'([^']*)')",
+    re.S)
 
 # Nested-archive extensions. A zip whose members are themselves archives can
 # hide a bomb the flat central-directory listing scores as tiny — depth-by-'/'
@@ -179,6 +213,112 @@ def zip_bomb_check(fd, size):
     return (len(reasons) == 0), reasons
 
 
+def _xml_attr(tag, name):
+    m = re.search(r"\b" + name + r"\s*=\s*(?:\"([^\"]*)\"|'([^']*)')", tag)
+    return html.unescape((m.group(1) if m.group(1) is not None else m.group(2)) if m else "")
+
+
+def _field_text(raw):
+    # CDATA content counts, comments and stray tags do not; character references are
+    # resolved — "&#68;DE" must read as "DDE" exactly as Word reads it.
+    raw = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", raw, flags=re.S)
+    raw = re.sub(r"<!--.*?-->", "", raw, flags=re.S)
+    return html.unescape(re.sub(r"<[^>]*>", "", raw))
+
+
+def _decode_part(raw):
+    # Word reads UTF-16 parts; a regex over a UTF-8 decode of them sees nothing.
+    # BOM-marked UTF-16 is decoded; NUL bytes without a BOM fail CLOSED.
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16", errors="replace")
+    if b"\x00" in raw:
+        return None
+    return raw.decode("utf-8", errors="replace")
+
+
+def ooxml_check(fd):
+    """
+    Phase 2b, .docx only: the zip already passed the bomb quotas; now look at what Word
+    would DO with it on open. XML parts are read as text with regexes, never with an XML
+    parser — no entity expansion on untrusted input. Reasons are a fixed vocabulary:
+    nothing from the file itself is echoed into the chat. Anomalies fail CLOSED.
+    Returns (ok: bool, reasons: list[str]).
+    """
+    reasons = set()
+    fields = []
+    try:
+        with reopen(fd) as f, zipfile.ZipFile(f) as zf:
+            infos = zf.infolist()
+            names = [i.filename.lower().replace("\\", "/") for i in infos]
+            if "[content_types].xml" not in names or "word/document.xml" not in names:
+                reasons.add("docx_structure_missing")
+            if any(n.rsplit("/", 1)[-1] in OOXML_ACTIVE_PARTS for n in names):
+                reasons.add("docx_macros")
+            if any(d in "/" + n for n in names for d in OOXML_ACTIVE_DIRS):
+                reasons.add("docx_embedded_objects")
+            for info, n in zip(infos, names):
+                is_rels = n.endswith(".rels")
+                is_word_xml = n.startswith("word/") and n.endswith(".xml")
+                if not (is_rels or is_word_xml or n == "[content_types].xml"):
+                    continue
+                if info.file_size > OOXML_PART_READ_CAP:
+                    reasons.add("docx_part_too_large")
+                    continue
+                with zf.open(info) as m:
+                    text = _decode_part(m.read(OOXML_PART_READ_CAP + 1))
+                if text is None:
+                    reasons.add("docx_part_encoding_unusual")
+                    continue
+                if n == "[content_types].xml":
+                    if "macroenabled" in text.lower():
+                        reasons.add("docx_macros")
+                    continue
+                if is_rels:
+                    for tag in _RE_REL.findall(text):
+                        rtype = _xml_attr(tag, "Type").lower()
+                        if rtype.endswith(OOXML_ACTIVE_REL_TYPES):
+                            reasons.add("docx_active_relationship")
+                        if (_xml_attr(tag, "TargetMode").lower() == "external"
+                                and not rtype.endswith(OOXML_EXTERNAL_REL_ALLOWED)):
+                            reasons.add("docx_external_reference")
+                    continue
+                # Field codes: one buffer per field on a stack, so a code split across
+                # many runs ("DD" + "E") is joined, and nested fields stay separate.
+                stack = []
+                for kind, instr, simple_dq, simple_sq in _RE_FIELD_TOKENS.findall(text):
+                    if kind == "begin":
+                        stack.append("")
+                    elif kind == "end":
+                        if stack:
+                            fields.append(stack.pop())
+                    elif kind == "separate":
+                        pass
+                    elif simple_dq or simple_sq:
+                        fields.append(html.unescape(simple_dq or simple_sq))
+                    else:
+                        piece = _field_text(instr)
+                        if stack:
+                            stack[-1] += piece
+                        else:
+                            fields.append(piece)
+                fields.extend(stack)
+    except zipfile.BadZipFile:
+        return False, ["zip_unreadable_or_corrupt"]
+    except Exception:
+        return False, ["docx_parse_error"]
+
+    for code in fields:
+        m = re.match(r"\s*([A-Za-z]+)", code)
+        if m and m.group(1).upper() in OOXML_ACTIVE_FIELDS:
+            reasons.add("docx_active_field:" + m.group(1).upper())
+        # DDE runs a command; it is looked for anywhere in a code, not only as its
+        # first word, in case some layout still glues it behind another field.
+        if re.search(r"(?<![A-Z])DDE(?:AUTO)?(?![A-Z])", code.upper()):
+            reasons.add("docx_active_field:DDE")
+
+    return (len(reasons) == 0), sorted(reasons)
+
+
 def polyglot_check(fd, mime, size):
     """
     Codex review #3: `file` reports only the FIRST format it recognizes, so a
@@ -238,6 +378,13 @@ def static_gate(fd, mime, size):
         ok, zip_reasons = zip_bomb_check(fd, size)
         if not ok:
             reasons.extend(zip_reasons)
+
+    # Content rules run only on a zip that passed the quotas: reading parts of a
+    # bomb is exactly the work the quotas exist to refuse.
+    if mime == DOCX_MIME and not reasons:
+        ok, docx_reasons = ooxml_check(fd)
+        if not ok:
+            reasons.extend(docx_reasons)
 
     status = "reject" if reasons else "ok"
     return status, reasons
