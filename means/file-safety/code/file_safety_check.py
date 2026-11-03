@@ -22,15 +22,15 @@ redirect what gets scanned nor attach our verdict to a different file.
 
 import errno
 import hashlib
-import html
 import json
 import os
-import re
 import shutil
 import stat as stat_mod
 import subprocess
 import sys
 import time
+import urllib.parse
+import xml.parsers.expat
 import zipfile
 
 # ---------------------------------------------------------------------------
@@ -49,7 +49,8 @@ MIME_WHITELIST_PREFIXES = (
 )
 # Word .docx (OOXML) — admitted 03.11.2026 at the node owner's request (Грибница 8971).
 # It is a zip container: listed in ARCHIVE_MIME_TYPES too (bomb quotas apply, the
-# "zip inside a non-zip" polyglot rule does not) and it must also pass ooxml_check().
+# "zip inside a non-zip" polyglot rule does not), and every zip that turns out to be an
+# OOXML package must also pass ooxml_check().
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 MIME_WHITELIST_EXACT = {
@@ -73,38 +74,104 @@ ZIP_MAX_NESTED_DEPTH = 15    # path separators inside the archive as a depth pro
 
 ARCHIVE_MIME_TYPES = {"application/zip", DOCX_MIME}
 
-# .docx content rules. A document may point outside itself only by hyperlink: a link
-# fires on a click. Any other external relationship (attachedTemplate, frame, a picture
-# linked by URL...) makes Word fetch remote content on open — the remote-template channel.
-OOXML_EXTERNAL_REL_ALLOWED = ("/hyperlink",)
-# Relationship types that carry code or opaque objects even when the target is internal
-# (an OLE blob can sit at any path, so the directory rule alone is not enough).
-OOXML_ACTIVE_REL_TYPES = ("/oleobject", "/package", "/control", "/activexcontrolbinary",
-                          "/vbaproject", "/afchunk", "/subdocument")
-OOXML_ACTIVE_PARTS = ("vbaproject.bin", "vbadata.xml")
-OOXML_ACTIVE_DIRS = ("/embeddings/", "/activex/")
-# Field codes that pull or run something external when the document opens or updates.
-OOXML_ACTIVE_FIELDS = ("DDE", "DDEAUTO", "INCLUDETEXT", "INCLUDEPICTURE", "LINK", "IMPORT")
-OOXML_PART_READ_CAP = 20 * 1024 * 1024
-
-# Any namespace prefix (or none): Word accepts the WordprocessingML namespace bound to
-# any prefix, so matching the literal "w:" would let a renamed prefix walk past.
-_NS = r"(?:[\w.-]+:)?"
-_RE_REL = re.compile(r"<" + _NS + r"Relationship\b[^>]*>", re.S)
-_RE_FIELD_TOKENS = re.compile(
-    r"<" + _NS + r"fldChar\b[^>]*?" + _NS + r"fldCharType\s*=\s*[\"'](begin|separate|end)[\"']"
-    # (?<!/) — a self-closing <instrText/> must not open a span that swallows the
-    # next field up to some later </instrText> and glues two codes into one.
-    r"|<" + _NS + r"instrText\b[^>]*(?<!/)>(.*?)</" + _NS + r"instrText\s*>"
-    r"|<" + _NS + r"fldSimple\b[^>]*?" + _NS + r"instr\s*=\s*(?:\"([^\"]*)\"|'([^']*)')",
-    re.S)
-
 # Nested-archive extensions. A zip whose members are themselves archives can
 # hide a bomb the flat central-directory listing scores as tiny — depth-by-'/'
 # never sees zip-in-zip. At MVP we refuse such archives rather than recurse.
 ARCHIVE_EXTENSIONS = (".zip", ".gz", ".bz2", ".xz", ".7z", ".rar", ".tar",
                       ".tgz", ".tbz2", ".jar", ".war", ".apk", ".zipx",
-                      ".lz", ".lzma", ".cab", ".arj")
+                      ".lz", ".lzma", ".cab", ".arj",
+                      # Office/ODF files are zips too: a .docx packed inside a plain zip
+                      # would reach quarantine without ever meeting ooxml_check().
+                      ".docx", ".docm", ".dotx", ".dotm", ".xlsx", ".xlsm", ".xltx",
+                      ".xltm", ".xlsb", ".xlam", ".pptx", ".pptm", ".potx", ".potm",
+                      ".ppsx", ".ppsm", ".ppam", ".sldx", ".sldm", ".vsdx", ".vsdm",
+                      ".odt", ".ods", ".odp", ".odg", ".odf", ".odb", ".odm", ".ott",
+                      ".ots", ".otp", ".otg", ".odc", ".otc", ".odi", ".oti", ".otf", ".oth")
+
+# --- OOXML (Office Open XML) content rules -----------------------------------------
+# Parts are read with a real XML parser and matched by EXPANDED name (namespace URI +
+# local name): prefix spelling, quoting, character references, comments, CDATA and
+# attribute order then carry no security meaning. A regex version of this check was
+# bypassed eight ways in review (codex sol, 03.11.2026) — do not go back to regexes.
+NS_CT = "http://schemas.openxmlformats.org/package/2006/content-types"
+NS_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+NS_WML = ("http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+          "http://purl.oclc.org/ooxml/wordprocessingml/main")
+NS_MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+# A document may point outside itself only by hyperlink: a link fires on a click. Any
+# other external relationship (attachedTemplate, frame, a picture linked by URL...) makes
+# the editor fetch remote content on open — the remote-template channel.
+OOXML_HYPERLINK_REL_TYPES = {
+    "http://schemas.openxmlformats.org/officedocument/2006/relationships/hyperlink",
+    "http://purl.oclc.org/ooxml/officedocument/relationships/hyperlink",
+}
+# Relationship kinds that carry code or opaque objects even with an internal target.
+OOXML_ACTIVE_REL_KINDS = {"oleobject", "package", "control", "activexcontrolbinary",
+                          "vbaproject", "afchunk", "subdocument"}
+# Content types of code and opaque objects; any "macroEnabled" main type as well.
+OOXML_ACTIVE_CONTENT_TYPES = {
+    "application/vnd.ms-office.vbaproject",
+    "application/vnd.ms-office.vbaprojectsignature",
+    "application/vnd.ms-office.activex",
+    "application/vnd.ms-office.activex+xml",
+    "application/vnd.openxmlformats-officedocument.oleobject",
+}
+# Field codes that pull or run something external when the document opens or updates.
+OOXML_ACTIVE_FIELDS = {"DDE", "DDEAUTO", "INCLUDETEXT", "INCLUDEPICTURE", "LINK", "IMPORT"}
+OOXML_MAX_FIELD_CODE = 64 * 1024        # real field codes are short; a huge one is a probe
+OOXML_MAX_XML_BYTES = 100 * 1024 * 1024  # XML fed to the parser per package
+OOXML_CHUNK = 64 * 1024
+OOXML_MAX_OPEN_FIELDS = 64               # nesting of complex fields
+OOXML_MAX_XML_DEPTH = 256                # element nesting in one part
+OOXML_MAX_CT_ENTRIES = 10_000            # Default/Override entries in the manifest
+# Field semantics apply only to parts typed as Word stories; custom XML data that merely
+# quotes WML vocabulary is data, not a field (review round 2, P2-N2).
+OOXML_WML_PART_TYPE_PREFIXES = ("application/vnd.openxmlformats-officedocument.wordprocessingml.",
+                                "application/vnd.ms-word.")
+OOXML_WML_MAIN_TYPE_MARKERS = ("wordprocessingml.document.main+xml",
+                               "wordprocessingml.template.main+xml",
+                               "ms-word.document.macroenabled.main+xml",
+                               "ms-word.template.macroenabledtemplate.main+xml")
+# Namespaces a Word reader understands inside a story. An element from any OTHER namespace
+# is, at best, an ignorable extension the reader throws away with its whole subtree — so
+# a field fragment under it means something different to the reader and to this scan.
+# EXACT identifiers: a namespace URI is a name, not a path — an invented URI under a vendor
+# prefix is still unknown to the reader (review round 3 P1: startswith() let it through).
+OOXML_KNOWN_NS = frozenset(NS_WML) | {
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships",
+    "http://schemas.openxmlformats.org/officeDocument/2006/math",
+    "http://purl.oclc.org/ooxml/officeDocument/math",
+    "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+    "http://purl.oclc.org/ooxml/drawingml/wordprocessingDrawing",
+    "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "http://purl.oclc.org/ooxml/drawingml/main",
+    "http://schemas.openxmlformats.org/drawingml/2006/picture",
+    "http://purl.oclc.org/ooxml/drawingml/picture",
+    "http://schemas.microsoft.com/office/word/2010/wordprocessingShape",
+    "http://schemas.microsoft.com/office/word/2010/wordprocessingGroup",
+    "http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas",
+    "http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing",
+    "http://schemas.microsoft.com/office/word/2010/wordml",
+    "http://schemas.microsoft.com/office/word/2012/wordml",
+    "http://schemas.microsoft.com/office/word/2015/wordml/symex",
+    "http://schemas.microsoft.com/office/word/2016/wordml/cid",
+    "http://schemas.microsoft.com/office/word/2018/wordml",
+    "http://schemas.microsoft.com/office/word/2018/wordml/cex",
+    "http://schemas.microsoft.com/office/word/2023/wordml/word16du",
+    "http://schemas.microsoft.com/office/drawing/2010/main",
+    "urn:schemas-microsoft-com:vml",
+    "urn:schemas-microsoft-com:office:office",
+    "urn:schemas-microsoft-com:office:word",
+}
+# Relationship kinds whose target the reader opens as a Word story (fields live there).
+OOXML_STORY_REL_KINDS = {"officedocument", "header", "footer", "footnotes", "endnotes",
+                         "comments", "glossarydocument"}
+# Kinds that exist only in Word packages: their target must be WML on ANY route (zip or docx),
+# so member order — which decides what libmagic calls the file — cannot switch the check off.
+OOXML_WML_ONLY_REL_KINDS = {"header", "footer", "footnotes", "endnotes", "glossarydocument"}
+# Declared types that say nothing about a part — never a valid type for a story.
+OOXML_GENERIC_TYPES = {"application/xml", "text/xml", "application/octet-stream", "text/plain"}
 
 # Image formats whose spec fixes an end-of-stream terminator. Anything after
 # that terminator is a smuggling channel (polyglot / appended payload) — the
@@ -213,109 +280,343 @@ def zip_bomb_check(fd, size):
     return (len(reasons) == 0), reasons
 
 
-def _xml_attr(tag, name):
-    m = re.search(r"\b" + name + r"\s*=\s*(?:\"([^\"]*)\"|'([^']*)')", tag)
-    return html.unescape((m.group(1) if m.group(1) is not None else m.group(2)) if m else "")
+class _Refuse(Exception):
+    """Fixed-vocabulary reason; nothing from the file is ever echoed into the chat."""
 
 
-def _field_text(raw):
-    # CDATA content counts, comments and stray tags do not; character references are
-    # resolved — "&#68;DE" must read as "DDE" exactly as Word reads it.
-    raw = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", raw, flags=re.S)
-    raw = re.sub(r"<!--.*?-->", "", raw, flags=re.S)
-    return html.unescape(re.sub(r"<[^>]*>", "", raw))
+_NESTED = "\x00"   # stands in the outer field code where a nested field begins
 
 
-def _decode_part(raw):
-    # Word reads UTF-16 parts; a regex over a UTF-8 decode of them sees nothing.
-    # BOM-marked UTF-16 is decoded; NUL bytes without a BOM fail CLOSED.
-    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        return raw.decode("utf-16", errors="replace")
-    if b"\x00" in raw:
-        return None
-    return raw.decode("utf-8", errors="replace")
-
-
-def ooxml_check(fd):
+class _OoxmlScan:
     """
-    Phase 2b, .docx only: the zip already passed the bomb quotas; now look at what Word
-    would DO with it on open. XML parts are read as text with regexes, never with an XML
-    parser — no entity expansion on untrusted input. Reasons are a fixed vocabulary:
-    nothing from the file itself is echoed into the chat. Anomalies fail CLOSED.
-    Returns (ok: bool, reasons: list[str]).
+    Expat event handler for one XML part. Complex fields are tracked on a stack by their
+    PARSED fldCharType, so a code split over many runs is joined, nested fields stay
+    separate, and each finished code is judged at once (nothing accumulates).
+    """
+
+    # Conservative MVP choices (named, not hidden): a field fragment inside markup-
+    # compatibility alternatives, inside tracked-change markup, or under an element of an
+    # unknown namespace is REFUSED instead of evaluated per reader view — the same stance
+    # the gate takes on nested archives (refuse rather than recurse). Cost: such documents
+    # (e.g. a page number in a text box wrapped in mc:AlternateContent) are rejected.
+    FIELD_ELEMENTS = ("fldChar", "instrText", "delInstrText", "fldSimple")
+    REVISION_ELEMENTS = ("ins", "del", "moveFrom", "moveTo")
+
+    def __init__(self, reasons, wml_story=True):
+        self.reasons = reasons
+        self.wml_story = wml_story
+        self.stack = []        # open complex fields: {"code": [...], "len": n, "instr": bool}
+        self.in_instr = 0
+        self.orphan = None     # instruction text outside any open field
+        self.depth = 0
+        self.flags = []        # per open element: (alt, revision, foreign)
+        self.alt = self.rev = self.foreign = 0
+        self.story_targets = []
+
+    def _judge(self, code):
+        head = code.lstrip()
+        if head.startswith(_NESTED):
+            # the keyword itself would come from a nested field's result
+            self.reasons.add("ooxml_field_computed_keyword")
+            return
+        word = ""
+        for ch in head:
+            if not ch.isalpha():
+                break
+            word += ch
+        if word.upper() in OOXML_ACTIVE_FIELDS:
+            self.reasons.add("ooxml_active_field:" + word.upper())
+
+    def _sink(self):
+        if self.orphan is not None:
+            return self.orphan
+        if self.stack and self.stack[-1]["instr"]:
+            return self.stack[-1]
+        return None
+
+    def _in_instr_phase(self):
+        return self.in_instr or (self.stack and self.stack[-1]["instr"])
+
+    def start(self, name, attrs):
+        uri, _, local = name.rpartition(" ")
+        self.depth += 1
+        if self.depth > OOXML_MAX_XML_DEPTH:
+            raise _Refuse("ooxml_xml_too_deep")
+        is_alt = uri == NS_MC and local == "AlternateContent"
+        is_rev = uri in NS_WML and local in self.REVISION_ELEMENTS
+        is_foreign = bool(uri) and uri not in OOXML_KNOWN_NS
+        if self.wml_story and self._in_instr_phase():
+            if is_alt:
+                self.reasons.add("ooxml_field_alternatecontent")
+            if is_rev:
+                self.reasons.add("ooxml_field_tracked_change")
+            if is_foreign:
+                self.reasons.add("ooxml_field_foreign_markup")
+        if self.wml_story and uri in NS_WML and local in self.FIELD_ELEMENTS:
+            if self.alt:
+                self.reasons.add("ooxml_field_alternatecontent")
+            if self.rev or local == "delInstrText":
+                self.reasons.add("ooxml_field_tracked_change")
+            if self.foreign:
+                self.reasons.add("ooxml_field_foreign_markup")
+        self.flags.append((is_alt, is_rev, is_foreign))
+        self.alt += is_alt; self.rev += is_rev; self.foreign += is_foreign
+        if not self.wml_story and not (uri == NS_REL and local == "Relationship"):
+            return
+        if uri == NS_REL and local == "Relationship":
+            rtype = attrs.get("Type", "").strip().lower()
+            if (rtype.rsplit("/", 1)[-1] in OOXML_STORY_REL_KINDS
+                    and attrs.get("TargetMode", "").strip().lower() != "external"):
+                self.story_targets.append((rtype.rsplit("/", 1)[-1], attrs.get("Target", "")))
+            if rtype.rsplit("/", 1)[-1] in OOXML_ACTIVE_REL_KINDS:
+                self.reasons.add("ooxml_active_relationship")
+            if (attrs.get("TargetMode", "").strip().lower() == "external"
+                    and rtype not in OOXML_HYPERLINK_REL_TYPES):
+                self.reasons.add("ooxml_external_reference")
+        elif uri in NS_WML:
+            if local == "fldChar":
+                kind = attrs.get(uri + " fldCharType", attrs.get("fldCharType", ""))
+                if kind == "begin":
+                    if len(self.stack) >= OOXML_MAX_OPEN_FIELDS:
+                        raise _Refuse("ooxml_field_nesting")
+                    if self.stack and self.stack[-1]["instr"]:
+                        self.stack[-1]["code"].append(_NESTED)
+                        self.stack[-1]["len"] += 1
+                        if self.stack[-1]["len"] > OOXML_MAX_FIELD_CODE:
+                            raise _Refuse("ooxml_field_too_long")
+                    self.stack.append({"code": [], "len": 0, "instr": True})
+                elif kind == "separate":
+                    if self.stack:
+                        self.stack[-1]["instr"] = False
+                elif kind == "end":
+                    if self.stack:
+                        self._judge("".join(self.stack.pop()["code"]))
+            elif local in ("instrText", "delInstrText"):
+                self.in_instr += 1
+                if self.in_instr == 1 and not (self.stack and self.stack[-1]["instr"]):
+                    self.orphan = {"code": [], "len": 0}
+            elif local == "fldSimple":
+                instr = attrs.get(uri + " instr", attrs.get("instr", ""))
+                if len(instr) > OOXML_MAX_FIELD_CODE:
+                    raise _Refuse("ooxml_field_too_long")
+                self._judge(instr)
+
+    def end(self, name):
+        uri, _, local = name.rpartition(" ")
+        self.depth -= 1
+        if self.flags:
+            a, r, f = self.flags.pop()
+            self.alt -= a; self.rev -= r; self.foreign -= f
+        if not self.wml_story:
+            return
+        if uri in NS_WML and local in ("instrText", "delInstrText") and self.in_instr:
+            self.in_instr -= 1
+            if self.in_instr == 0 and self.orphan is not None:
+                self._judge("".join(self.orphan["code"]))
+                self.orphan = None
+
+    def chars(self, data):
+        if not self.in_instr or not self.wml_story:
+            return
+        sink = self._sink()
+        if sink is None:
+            return
+        sink["len"] += len(data)
+        if sink["len"] > OOXML_MAX_FIELD_CODE:
+            raise _Refuse("ooxml_field_too_long")
+        sink["code"].append(data)
+
+    def finish(self):
+        for f in self.stack:
+            self._judge("".join(f["code"]))
+        if self.orphan is not None:
+            self._judge("".join(self.orphan["code"]))
+        self.stack, self.orphan = [], None
+
+
+def _parse_part(zf, info, handler, budget):
+    """Stream one member through expat; DTDs and entity declarations are refused."""
+    p = xml.parsers.expat.ParserCreate(namespace_separator=" ")
+    p.SetParamEntityParsing(xml.parsers.expat.XML_PARAM_ENTITY_PARSING_NEVER)
+
+    def no_dtd(*_a):
+        raise _Refuse("ooxml_xml_dtd")
+
+    p.StartDoctypeDeclHandler = no_dtd
+    p.EntityDeclHandler = no_dtd
+    p.StartElementHandler = handler.start
+    p.EndElementHandler = getattr(handler, "end", None)
+    p.CharacterDataHandler = getattr(handler, "chars", None)
+    with zf.open(info) as m:
+        while True:
+            chunk = m.read(OOXML_CHUNK)
+            budget[0] += len(chunk)
+            if budget[0] > OOXML_MAX_XML_BYTES:
+                raise _Refuse("ooxml_xml_too_large")
+            p.Parse(chunk, not chunk)
+            if not chunk:
+                break
+
+
+def _canon_part(raw):
+    """One canonical OPC part name for zip members AND manifest keys: percent-decoded,
+    lower-case, no leading slash. A backslash or a "." / ".." segment is not a valid part
+    name; refusing it stops one name from meaning different parts in different places
+    (round 5: "a%5C..%5Cheader.xml" escaped role and field checks)."""
+    n = urllib.parse.unquote(raw)
+    if "\\" in n:
+        raise _Refuse("ooxml_structure_invalid")
+    segs = [x for x in n.split("/") if x]
+    if not segs or any(x in (".", "..") for x in segs):
+        raise _Refuse("ooxml_structure_invalid")
+    return "/".join(segs).lower()
+
+
+class _ContentTypes:
+    """[Content_Types].xml in its only valid shape: root Types, children Default/Override,
+    each key declared once. Anything else is refused — a second Override must not be able
+    to overwrite a prohibited type (review round 3 P3)."""
+
+    def __init__(self):
+        self.defaults, self.overrides = {}, {}
+        self.root = None
+        self.depth = 0
+        self.count = 0
+
+    def start(self, name, attrs):
+        uri, _, local = name.rpartition(" ")
+        self.depth += 1
+        if self.root is None:
+            self.root = (uri, local)
+            if self.root != (NS_CT, "Types"):
+                raise _Refuse("ooxml_structure_invalid")
+            return
+        if self.depth != 2 or uri != NS_CT or local not in ("Default", "Override"):
+            raise _Refuse("ooxml_structure_invalid")
+        self.count += 1
+        if self.count > OOXML_MAX_CT_ENTRIES:
+            raise _Refuse("ooxml_structure_invalid")
+        ct = attrs.get("ContentType", "").strip().lower()
+        key_attr, table = (("Extension", self.defaults) if local == "Default"
+                           else ("PartName", self.overrides))
+        raw = attrs.get(key_attr, "").strip()
+        key = ("/" + _canon_part(raw)) if local == "Override" else raw.lower()
+        if not key or not ct or key in table:
+            raise _Refuse("ooxml_structure_invalid")
+        table[key] = ct
+
+    def end(self, name):
+        self.depth -= 1
+
+
+def ooxml_check(fd, is_docx):
+    """
+    Phase 2b. Runs on every zip that passed the quotas. A zip with no [Content_Types].xml
+    is not an OOXML package and is left to the generic archive rules — unless libmagic
+    called it a .docx, which then fails as malformed. For a package: forbidden content
+    types, active or external relationships in ANY .rels, and active field codes in ANY
+    part whose declared content type is XML (wherever it lives, whatever its extension).
+    Anomalies fail CLOSED. Returns (ok: bool, reasons: list[str]).
     """
     reasons = set()
-    fields = []
+    budget = [0]
     try:
         with reopen(fd) as f, zipfile.ZipFile(f) as zf:
             infos = zf.infolist()
-            names = [i.filename.lower().replace("\\", "/") for i in infos]
-            if "[content_types].xml" not in names or "word/document.xml" not in names:
-                reasons.add("docx_structure_missing")
-            if any(n.rsplit("/", 1)[-1] in OOXML_ACTIVE_PARTS for n in names):
-                reasons.add("docx_macros")
-            if any(d in "/" + n for n in names for d in OOXML_ACTIVE_DIRS):
-                reasons.add("docx_embedded_objects")
+            # A zip without a manifest is not an OPC package: generic archive rules only.
+            if not any(urllib.parse.unquote(i.filename).lstrip("/").lower() == "[content_types].xml"
+                       for i in infos):
+                return (False, ["ooxml_structure_missing"]) if is_docx else (True, [])
+            # ONE part-name form for zip members, manifest keys and relationship targets
+            # (round 4: mixing forms let "header%20x.xml" escape every check).
+            infos = [i for i in infos if not i.is_dir()]
+            names = [_canon_part(i.filename) for i in infos]
+            if len(set(names)) != len(names):
+                reasons.add("ooxml_duplicate_part")
+            ct = _ContentTypes()
+            _parse_part(zf, infos[names.index("[content_types].xml")], ct, budget)
+            if ct.root is None:
+                raise _Refuse("ooxml_structure_invalid")
+            declared_all = list(ct.defaults.values()) + list(ct.overrides.values())
+            for value in declared_all:
+                if "macroenabled" in value or value in OOXML_ACTIVE_CONTENT_TYPES:
+                    reasons.add("ooxml_active_content_type")
+            def declared_type(n):
+                leaf = n.rsplit("/", 1)[-1]
+                return ct.overrides.get("/" + n) or ct.defaults.get(
+                    leaf.rsplit(".", 1)[-1] if "." in leaf else "")
+
+            def is_wml_type(t):
+                return bool(t) and t.startswith(OOXML_WML_PART_TYPE_PREFIXES) and t.endswith("xml")
+
+            # 1) every .rels: active/external relationships, and which parts are stories
+            present = set(names)
+            main_ok = False
+            stories = []
             for info, n in zip(infos, names):
-                is_rels = n.endswith(".rels")
-                is_word_xml = n.startswith("word/") and n.endswith(".xml")
-                if not (is_rels or is_word_xml or n == "[content_types].xml"):
+                if reasons:
+                    break      # decided: no need to build more state from a hostile file
+                if not n.endswith(".rels"):
                     continue
-                if info.file_size > OOXML_PART_READ_CAP:
-                    reasons.add("docx_part_too_large")
+                scan = _OoxmlScan(reasons, wml_story=False)
+                _parse_part(zf, info, scan, budget)
+                # source part of "dir/_rels/name.rels" is "dir/name"; package rels -> root
+                src_dir = n[:-len(".rels")].rsplit("/_rels/", 1)[0] if "/_rels/" in n else ""
+                for kind, target in scan.story_targets:
+                    t = target.strip().split("#", 1)[0].split("?", 1)[0]
+                    t = urllib.parse.unquote(t)
+                    if "\\" in t:
+                        raise _Refuse("ooxml_structure_invalid")
+                    path = t.lstrip("/") if t.startswith("/") else (
+                        (src_dir + "/" if src_dir else "") + t)
+                    parts = []
+                    for seg in path.split("/"):
+                        if seg in ("", "."):
+                            continue
+                        if seg == "..":
+                            if parts:
+                                parts.pop()
+                            continue
+                        parts.append(seg)
+                    stories.append((n, kind, "/".join(parts).lower()))
+            for src, kind, story in stories:
+                stype = declared_type(story)
+                if (src == "_rels/.rels" and kind == "officedocument" and story in present
+                        and stype and any(m in stype for m in OOXML_WML_MAIN_TYPE_MARKERS)):
+                    main_ok = True
+            wml_package = is_docx or main_ok
+            for src, kind, story in stories:
+                if story not in present:
                     continue
-                with zf.open(info) as m:
-                    text = _decode_part(m.read(OOXML_PART_READ_CAP + 1))
-                if text is None:
-                    reasons.add("docx_part_encoding_unusual")
+                stype = declared_type(story)
+                # a story the reader would open must be declared as WML; a generic, missing
+                # or foreign type would hide it from the field scan below
+                if not is_wml_type(stype) and (
+                        kind in OOXML_WML_ONLY_REL_KINDS or wml_package
+                        or stype in OOXML_GENERIC_TYPES or stype is None):
+                    reasons.add("ooxml_structure_invalid")
+            # a .docx must name an EXISTING main part of a Word main type from the package
+            # relationships — a declared-but-absent Override is not a main part (round 3 P3)
+            if is_docx and not main_ok:
+                reasons.add("ooxml_structure_missing")
+            # 2) field semantics in every part typed as a Word story
+            for info, n in zip(infos, names):
+                if reasons:
+                    break
+                if n == "[content_types].xml" or n.endswith("/") or n.endswith(".rels"):
                     continue
-                if n == "[content_types].xml":
-                    if "macroenabled" in text.lower():
-                        reasons.add("docx_macros")
-                    continue
-                if is_rels:
-                    for tag in _RE_REL.findall(text):
-                        rtype = _xml_attr(tag, "Type").lower()
-                        if rtype.endswith(OOXML_ACTIVE_REL_TYPES):
-                            reasons.add("docx_active_relationship")
-                        if (_xml_attr(tag, "TargetMode").lower() == "external"
-                                and not rtype.endswith(OOXML_EXTERNAL_REL_ALLOWED)):
-                            reasons.add("docx_external_reference")
-                    continue
-                # Field codes: one buffer per field on a stack, so a code split across
-                # many runs ("DD" + "E") is joined, and nested fields stay separate.
-                stack = []
-                for kind, instr, simple_dq, simple_sq in _RE_FIELD_TOKENS.findall(text):
-                    if kind == "begin":
-                        stack.append("")
-                    elif kind == "end":
-                        if stack:
-                            fields.append(stack.pop())
-                    elif kind == "separate":
-                        pass
-                    elif simple_dq or simple_sq:
-                        fields.append(html.unescape(simple_dq or simple_sq))
-                    else:
-                        piece = _field_text(instr)
-                        if stack:
-                            stack[-1] += piece
-                        else:
-                            fields.append(piece)
-                fields.extend(stack)
+                if is_wml_type(declared_type(n)):
+                    scan = _OoxmlScan(reasons, wml_story=True)
+                    _parse_part(zf, info, scan, budget)
+                    scan.finish()
+    except _Refuse as r:
+        reasons.add(str(r))
     except zipfile.BadZipFile:
         return False, ["zip_unreadable_or_corrupt"]
+    except xml.parsers.expat.ExpatError:
+        reasons.add("ooxml_xml_malformed")
     except Exception:
-        return False, ["docx_parse_error"]
-
-    for code in fields:
-        m = re.match(r"\s*([A-Za-z]+)", code)
-        if m and m.group(1).upper() in OOXML_ACTIVE_FIELDS:
-            reasons.add("docx_active_field:" + m.group(1).upper())
-        # DDE runs a command; it is looked for anywhere in a code, not only as its
-        # first word, in case some layout still glues it behind another field.
-        if re.search(r"(?<![A-Z])DDE(?:AUTO)?(?![A-Z])", code.upper()):
-            reasons.add("docx_active_field:DDE")
-
+        reasons.add("ooxml_parse_error")
     return (len(reasons) == 0), sorted(reasons)
 
 
@@ -379,12 +680,13 @@ def static_gate(fd, mime, size):
         if not ok:
             reasons.extend(zip_reasons)
 
-    # Content rules run only on a zip that passed the quotas: reading parts of a
-    # bomb is exactly the work the quotas exist to refuse.
-    if mime == DOCX_MIME and not reasons:
-        ok, docx_reasons = ooxml_check(fd)
+    # Content rules only on a zip that passed the quotas (reading parts of a bomb is the
+    # work the quotas exist to refuse) — and on EVERY such zip: libmagic names a package
+    # by member order, so a reordered .docx arrives as plain application/zip.
+    if mime in ARCHIVE_MIME_TYPES and not reasons:
+        ok, ooxml_reasons = ooxml_check(fd, is_docx=(mime == DOCX_MIME))
         if not ok:
-            reasons.extend(docx_reasons)
+            reasons.extend(ooxml_reasons)
 
     status = "reject" if reasons else "ok"
     return status, reasons
