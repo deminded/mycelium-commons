@@ -16,10 +16,15 @@ short reply with the honest verdict — never "safe".
 Sequential processing is deliberate: one file fully through the gates before
 the next update is fetched (a quarantine circuit should not race itself).
 """
+import errno
+import grp
 import json
 import os
+import pwd
 import re
+import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -44,49 +49,269 @@ BOT_API_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # getFile hard limit
 # Semantic triage (phase 4) — hand a quarantined file to the detonated reader
 # running as uid fs-triage and wait for its data-only signal. That reader is
 # network-isolated (iptables) and disposable; see fs-triage/triage_reader.py.
-# We only triage textual files (the vector is instructions in text) and we NEVER
-# let a triage result upgrade the verdict: quarantine stays quarantine. Triage
+# PDF/DOCX/HTML are converted by fs-triage before reading; other text is read as is.
+# We NEVER let a triage result upgrade the verdict: quarantine stays quarantine. Triage
 # adds a preview + flags for the owner, nothing more (design doc §4).
 TRIAGE_INBOX = "/opt/mycelium/fs-triage/inbox"
 TRIAGE_OUTBOX = "/opt/mycelium/fs-triage/outbox"
 TRIAGE_TEXTUAL_PREFIXES = ("text/", "application/json")
-TRIAGE_WAIT_SECONDS = 100
+TRIAGE_CONVERT_KINDS = {
+    "application/pdf": "pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "text/html": "html",
+}
+# Coupled to daemon timeouts: conversion 60s + reader 90s + queue/poll margin.
+TRIAGE_WAIT_SECONDS = 170
 TRIAGE_POLL = 2
 
 
+# Allow DEFLATE overhead, ZIP headers and filenames on top of the expanded cap.
+# Independent of the parser code: intake must not import anything from fs-triage.
+# Repository regression checks >= md_convert.MAX_OUTPUT_BYTES + 1 MiB overhead.
+MAX_CONVERT_ZIP_BYTES = 51 * 1024 * 1024
+MAX_TRIAGE_RESULT_BYTES = 1024 * 1024
+
+
+class OutboxRejected(Exception):
+    pass
+
+
+JOURNAL_FILE = os.path.join(BASE, "journal.log")
+# Mirrored ALLOWED_FLAGS from the reader; intake cannot import producer code.
+RESULT_KNOWN_FLAGS = {
+    "imperative_to_reader", "role_override", "hidden_instructions",
+    "exfiltration_lure", "suspicious_urls", "encoding_tricks",
+}
+RESULT_FLAG_PATTERN = re.compile(r"[a-z_]{1,48}(:[A-Za-z0-9_.-]{1,48})?", re.ASCII)
+MAX_RESULT_FLAGS = 12
+
+
+def filter_result_flags(flags):
+    kept = []
+    rejected = 0
+    for flag in flags:
+        if (isinstance(flag, str) and RESULT_FLAG_PATTERN.fullmatch(flag)
+                and (flag.split(":", 1)[0] in RESULT_KNOWN_FLAGS
+                     or flag.startswith(("convert_", "triage_", "reader_")))
+                and len(kept) < MAX_RESULT_FLAGS):
+            kept.append(flag)
+        else:
+            rejected += 1
+    if rejected:
+        if len(kept) == MAX_RESULT_FLAGS:
+            kept.pop()
+            rejected += 1
+        kept.append("result_flags_rejected:" + str(rejected))
+    return kept
+
+
+def add_result_refusal(result, flag):
+    flags = result["flags"]
+    rejected = sum(int(f.split(":", 1)[1]) for f in flags if f.startswith("result_flags_rejected:"))
+    kept = [f for f in flags if not f.startswith("result_flags_rejected:")]
+    # Reserve the new local refusal and, if needed, the rejection counter.
+    if len(kept) + 1 + bool(rejected) > MAX_RESULT_FLAGS:
+        limit = MAX_RESULT_FLAGS - 2
+        rejected += len(kept) - limit
+        kept = kept[:limit]
+    result["flags"] = kept + [flag]
+    if rejected:
+        result["flags"].append("result_flags_rejected:" + str(rejected))
+
+
+def rejection_event(name, action, reason=""):
+    record = {"event": "outbox_rejected", "ts": int(time.time()),
+              "name": name, "action": action, "reason": reason}
+    # The journal and stdout both retain a visible refusal, including failed cleanup.
+    print(json.dumps(record, ensure_ascii=True), flush=True)
+    try:
+        with open(JOURNAL_FILE, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, ensure_ascii=True) + "\n")
+    except OSError as exc:
+        print(f"[warn] rejection journal failed: {type(exc).__name__}", flush=True)
+
+
+def discard_outbox(path):
+    """Unlink a regular result, isolate everything else without walking it."""
+    name = os.path.basename(path)
+    entry_found = False
+    try:
+        with_queue = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = os.stat(name, dir_fd=with_queue, follow_symlinks=False)
+            entry_found = True
+            if stat.S_ISREG(info.st_mode):
+                try:
+                    os.unlink(name, dir_fd=with_queue)
+                    return
+                except IsADirectoryError:
+                    pass  # Replaced by a directory; isolate it below.
+            # Provisioned as fs-triage:fs-triage 0770; intake never owns the bin.
+            rejected = os.open(".rejected", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                               dir_fd=with_queue)
+            try:
+                dest = secrets.token_hex(24)
+                os.rename(name, dest, src_dir_fd=with_queue, dst_dir_fd=rejected)
+                rejection_event(name, "isolated", dest)
+            finally:
+                os.close(rejected)
+        finally:
+            os.close(with_queue)
+    except FileNotFoundError as exc:
+        if entry_found:
+            rejection_event(name, "failed", type(exc).__name__)
+    except OSError as exc:
+        rejection_event(name, "failed", type(exc).__name__)
+
+
+def checked_outbox(path, limit):
+    """Return an open, bounded regular file owned by the producer uid."""
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OutboxRejected("nonregular")
+        if info.st_uid != pwd.getpwnam("fs-triage").pw_uid:
+            raise OutboxRejected("owner")
+        if info.st_size > limit:
+            raise OutboxRejected("size")
+        stream = os.fdopen(fd, "rb")
+        fd = None
+        return stream
+    except OSError as exc:
+        raise OutboxRejected("symlink" if exc.errno == errno.ELOOP else "open") from exc
+    except KeyError as exc:
+        raise OutboxRejected("producer_uid_missing") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def copy_outbox_zip(path, dest):
+    created = False
+    try:
+        with checked_outbox(path, MAX_CONVERT_ZIP_BYTES) as source:
+            fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            created = True
+            try:
+                target = os.fdopen(fd, "wb")
+            except Exception:
+                os.close(fd)
+                raise
+            with target:
+                total = 0
+                while True:
+                    chunk = source.read(64 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    # The producer can grow the inode after fstat.
+                    if total > MAX_CONVERT_ZIP_BYTES:
+                        raise OutboxRejected("size")
+                    target.write(chunk)
+    except Exception:
+        if created:
+            try:
+                os.unlink(dest)
+            except OSError as exc:
+                rejection_event(os.path.basename(path), "failed", type(exc).__name__)
+        raise
+    finally:
+        discard_outbox(path)
+
+
+def read_outbox_result(path):
+    try:
+        with checked_outbox(path, MAX_TRIAGE_RESULT_BYTES) as stream:
+            data = stream.read(MAX_TRIAGE_RESULT_BYTES + 1)
+        if len(data) > MAX_TRIAGE_RESULT_BYTES:
+            raise OutboxRejected("size")
+        result = json.loads(data)
+        if (not isinstance(result, dict) or not isinstance(result.get("flags"), list)
+                or not isinstance(result.get("summary", ""), str)):
+            raise OutboxRejected("schema")
+        result["flags"] = filter_result_flags(result["flags"])
+        return result
+    except (ValueError, UnicodeError) as exc:
+        raise OutboxRejected("json") from exc
+    finally:
+        discard_outbox(path)
+
+
 def triage(quarantined_path, mime):
-    """Run the semantic gate on a quarantined textual file. Returns the reader's
-    {summary, flags} dict, or a SKIPPED-shaped dict — never raises, never returns
-    a verdict. Non-textual or oversized-for-model inputs are skipped explicitly."""
-    if not any(mime.startswith(p) for p in TRIAGE_TEXTUAL_PREFIXES):
+    """Run the semantic gate on quarantined text or a convertible file. Returns
+    {summary, flags} (plus optional converted metadata) or a SKIPPED-shaped dict.
+    Never raises or returns a verdict. Unsupported MIME types skip explicitly."""
+    kind = TRIAGE_CONVERT_KINDS.get(mime)
+    if not kind and not any(mime.startswith(p) for p in TRIAGE_TEXTUAL_PREFIXES):
         return {"status": "SKIPPED:non_textual"}
     name = os.path.basename(quarantined_path)
-    inbox_path = os.path.join(TRIAGE_INBOX, name)
     outbox_path = os.path.join(TRIAGE_OUTBOX, name + ".json")
-    # Atomic handoff: the daemon lists inbox/ and would otherwise pick up a file
-    # mid-copy and triage a truncated body (an injection in the not-yet-written
-    # tail would slip past). Write to a dot-prefixed .partial (the daemon skips
-    # dotfiles) then rename into place — rename is atomic on the same fs.
-    partial = os.path.join(TRIAGE_INBOX, "." + name + ".partial")
+    # Pin the queue; create fresh inodes even if the producer preplants names.
+    queue_fd = None
+    owned = set()
+    kind_name = "." + name + ".kind"
+    kind_published = False
     try:
-        shutil.copyfile(quarantined_path, partial)
-        os.rename(partial, inbox_path)
-    except Exception as e:
         try:
-            os.remove(partial)
-        except OSError:
-            pass
+            triage_gid = grp.getgrnam("fs-triage").gr_gid
+        except KeyError:
+            return {"status": "SKIPPED:handoff_failed:group_missing:fs-triage"}
+        queue_fd = os.open(TRIAGE_INBOX, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        partial = "." + name + "." + secrets.token_hex(24) + ".partial"
+        fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o640, dir_fd=queue_fd)
+        owned.add(partial)
+        with os.fdopen(fd, "wb") as target, open(quarantined_path, "rb") as source:
+            os.fchown(target.fileno(), -1, triage_gid)
+            shutil.copyfileobj(source, target)
+        if kind:
+            kind_partial = "." + name + ".kind." + secrets.token_hex(24) + ".partial"
+            fd = os.open(kind_partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o640, dir_fd=queue_fd)
+            owned.add(kind_partial)
+            with os.fdopen(fd, "wb") as target:
+                os.fchown(target.fileno(), -1, triage_gid)
+                target.write((kind + "\n").encode("ascii"))
+            os.rename(kind_partial, kind_name, src_dir_fd=queue_fd, dst_dir_fd=queue_fd)
+            owned.remove(kind_partial)
+            kind_published = True
+        os.rename(partial, name, src_dir_fd=queue_fd, dst_dir_fd=queue_fd)
+        owned.remove(partial)
+    except Exception as e:
+        if kind_published:
+            owned.add(kind_name)
         return {"status": f"SKIPPED:handoff_failed:{type(e).__name__}"}
+    finally:
+        if queue_fd is not None:
+            for temporary in owned:
+                try:
+                    os.unlink(temporary, dir_fd=queue_fd)
+                except OSError:
+                    pass
+            os.close(queue_fd)
     waited = 0
     while waited < TRIAGE_WAIT_SECONDS:
-        if os.path.exists(outbox_path):
+        if os.path.lexists(outbox_path):
+            archive = os.path.join(TRIAGE_OUTBOX, name + ".md.zip")
             try:
-                with open(outbox_path, encoding="utf-8") as f:
-                    result = json.load(f)
-                os.remove(outbox_path)
-                return result
-            except Exception as e:
-                return {"status": f"SKIPPED:result_unreadable:{type(e).__name__}"}
+                result = read_outbox_result(outbox_path)
+            except Exception as exc:
+                discard_outbox(archive)
+                reason = str(exc) if isinstance(exc, OutboxRejected) else type(exc).__name__
+                return {"summary": "", "flags": ["convert_zip_rejected:result_" + reason]}
+            if os.path.lexists(archive):
+                try:
+                    copy_outbox_zip(archive, quarantined_path + ".md.zip")
+                except Exception as exc:
+                    reason = str(exc) if isinstance(exc, OutboxRejected) else type(exc).__name__
+                    add_result_refusal(result, "convert_zip_rejected:" + reason)
+                    result.pop("converted", None)
+            elif "converted" in result:
+                add_result_refusal(result, "convert_zip_rejected:missing")
+                result.pop("converted", None)
+            return result
         time.sleep(TRIAGE_POLL)
         waited += TRIAGE_POLL
     return {"status": "SKIPPED:timeout"}
@@ -100,7 +325,7 @@ def api(method, **params):
 
 
 def reply(chat_id, text, reply_to=None, thread_id=None):
-    params = {"chat_id": chat_id, "text": text}
+    params = {"chat_id": chat_id, "text": text[:3500]}
     if reply_to:
         params["reply_to_message_id"] = reply_to
         params["allow_sending_without_reply"] = "true"
@@ -244,6 +469,8 @@ def handle_file(msg):
         # mime comes from the label (the worker sniffed it), not a local var.
         tri = triage(qdest, str(label.get("mime", "")))
         tri_line = ""
+        if "converted" in tri:
+            label["converted"] = tri["converted"]
         if "flags" in tri:
             flags = tri.get("flags") or []
             # The summary is written BY a model that just read attacker-controlled
@@ -262,6 +489,9 @@ def handle_file(msg):
         else:
             tri_line = f"\n🔍 триаж: {tri.get('status', 'SKIPPED')}"
             label["llm_triage"] = tri.get("status", "SKIPPED")
+        if os.path.exists(qdest + ".md.zip"):
+            tri_line += ("\n📝 рядом с файлом — .md (zip), сделан конвертером под изоляцией; "
+                         "читать тоже как недоверенные данные")
         try:
             with open(lbl_dst, "w", encoding="utf-8") as f:
                 json.dump(label, f, ensure_ascii=False, indent=2)
