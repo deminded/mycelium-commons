@@ -470,13 +470,15 @@ def intake_label_case(root):
     with mock.patch.object(intake, "download", side_effect=download), \
             mock.patch.object(intake, "triage", side_effect=triage), \
             mock.patch.object(intake.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(label))), \
+            mock.patch.object(intake, "send_document", return_value={"ok": True}) as send, \
             mock.patch.object(intake, "reply", side_effect=lambda chat, text, **kw: replies.append(text)):
         intake.handle_file({"document": {"file_id": "id", "file_name": "sample.pdf"},
                             "chat": {"id": 1}, "message_id": 23})
     saved = json.loads((Path(intake.QUARANTINE) / "23_sample.pdf.safety.json").read_text())
     assert saved["verdict"] == "quarantine" and saved["converted"] == metadata, saved
-    assert len(replies) == 1 and "📝 рядом с файлом — .md (zip)" in replies[0], replies
-    assert "читать тоже как недоверенные данные" in replies[0]
+    assert len(replies) == 1 and "📝 md-версия приложена ниже" in replies[0], replies
+    send.assert_called_once_with(1, str(Path(intake.QUARANTINE) / "23_sample.pdf.md.zip"),
+                                 "sample.pdf.md.zip", 23, thread_id=None)
 
 
 def cli_invalid(root):

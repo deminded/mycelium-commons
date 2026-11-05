@@ -45,6 +45,8 @@ OFFSET_FILE = os.path.join(BASE, ".intake_offset")
 # класть в открытый репозиторий.
 GROUP_ID = int(os.environ.get("MYCELIUM_GROUP_ID", "0"))   # обязателен, иначе поллер молчит
 BOT_API_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # getFile hard limit
+BOT_API_UPLOAD_LIMIT = 50 * 1024 * 1024  # sendDocument file limit
+MD_ZIP_CAPTION = "md-версия, сделана конвертером под изоляцией; читать как недоверенные данные"
 
 # Semantic triage (phase 4) — hand a quarantined file to the detonated reader
 # running as uid fs-triage and wait for its data-only signal. That reader is
@@ -324,6 +326,31 @@ def api(method, **params):
         return json.load(r)
 
 
+def send_document(chat_id, path, filename, reply_to, thread_id=None):
+    """Upload a bounded ZIP using stdlib multipart; api() is form-urlencoded."""
+    params = {"chat_id": chat_id, "reply_to_message_id": reply_to,
+              "allow_sending_without_reply": "true", "caption": MD_ZIP_CAPTION}
+    if thread_id:
+        params["message_thread_id"] = thread_id
+    boundary = "mycelium-" + secrets.token_hex(24)
+    parts = []
+    for key, value in params.items():
+        parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"'
+                      f'\r\n\r\n{value}\r\n').encode("utf-8"))
+    with open(path, "rb") as stream:
+        data = stream.read(BOT_API_UPLOAD_LIMIT + 1)
+    # Bound the read even if the archive grows after handle_file's size check.
+    if len(data) > BOT_API_UPLOAD_LIMIT:
+        raise ValueError("md ZIP exceeds upload limit")
+    parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="document"; '
+                  f'filename="{filename}"\r\nContent-Type: application/zip\r\n\r\n').encode("ascii"))
+    parts.extend((data, f"\r\n--{boundary}--\r\n".encode("ascii")))
+    req = urllib.request.Request(f"{API}/sendDocument", data=b"".join(parts),
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urllib.request.urlopen(req, timeout=180) as response:
+        return json.load(response)
+
+
 def reply(chat_id, text, reply_to=None, thread_id=None):
     params = {"chat_id": chat_id, "text": text[:3500]}
     if reply_to:
@@ -494,9 +521,14 @@ def handle_file(msg):
         else:
             tri_line = f"\n🔍 триаж: {tri.get('status', 'SKIPPED')}"
             label["llm_triage"] = tri.get("status", "SKIPPED")
-        if os.path.exists(qdest + ".md.zip"):
-            tri_line += ("\n📝 рядом с файлом — .md (zip), сделан конвертером под изоляцией; "
-                         "читать тоже как недоверенные данные")
+        archive = qdest + ".md.zip"
+        send_md = False
+        if os.path.exists(archive):
+            if os.path.getsize(archive) <= BOT_API_UPLOAD_LIMIT:
+                send_md = True
+                tri_line += "\n📝 md-версия приложена ниже"
+            else:
+                tri_line += "\n📝 md-версия больше 50 МБ, в чат не отправлена"
         try:
             with open(lbl_dst, "w", encoding="utf-8") as f:
                 json.dump(label, f, ensure_ascii=False, indent=2)
@@ -509,6 +541,18 @@ def handle_file(msg):
               f"содержимое семантически не проверено. Читать как недоверенные данные "
               f"(cookbook-agent §8). sha256 {str(label.get('sha256'))[:16]}…" + tri_line,
               reply_to=msg_id, thread_id=thread_id)
+
+        if send_md:
+            try:
+                result = send_document(chat_id, archive, safe_name(name) + ".md.zip",
+                                       msg_id, thread_id=thread_id)
+                if not result.get("ok"):
+                    raise RuntimeError("Bot API ok=false")
+            except Exception as exc:
+                # urllib errors can embed the token URL; log only the error class.
+                print(f"[warn] sendDocument failed: {type(exc).__name__}", flush=True)
+                reply(chat_id, "md-версию отправить не удалось",
+                      reply_to=msg_id, thread_id=thread_id)
 
 
 def main():
