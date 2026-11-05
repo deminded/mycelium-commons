@@ -20,8 +20,15 @@ def mutations(source):
         ('size condition inverted', 'os.path.getsize(archive) <= BOT_API_UPLOAD_LIMIT',
          'os.path.getsize(archive) > BOT_API_UPLOAD_LIMIT'),
         ('send flag dropped', 'send_md = True', 'send_md = False'),
-        ('upload branch disabled', 'if send_md:', 'if False:'),
-        ('upload unconditionally', 'if send_md:', 'if True:'),
+        ('upload branch disabled', 'if send_md or md_error is not None:', 'if False:'),
+        ('upload unconditionally', 'if send_md or md_error is not None:', 'if True:'),
+        ('stat errors escape', 'except Exception as exc:\n            # Defer attachment failures',
+         'except ValueError as exc:\n            # Defer attachment failures'),
+        ('stat errors swallowed', 'md_error = exc', 'md_error = None'),
+        ('stat errors raised before verdict', 'md_error = exc', 'raise'),
+        ('stat failure handler skipped', 'if send_md or md_error is not None:', 'if send_md:'),
+        ('deferred error guard inverted', 'if md_error is not None:', 'if md_error is None:'),
+        ('deferred stat failure ignored', 'raise md_error', 'pass'),
         ('wrong small-ZIP verdict', '📝 md-версия приложена ниже', '📝 рядом с файлом — .md (zip)'),
         ('wrong oversize verdict', '📝 md-версия больше 50 МБ, в чат не отправлена', '📝 md-версия приложена ниже'),
         ('unsafe attachment name', 'safe_name(name) + ".md.zip"', 'name + ".md.zip"'),
@@ -55,7 +62,8 @@ def mutations(source):
         ('topic always present', 'if thread_id:', 'if True:'),
         ('chat wrong', '"chat_id": chat_id', '"chat_id": 0'),
         ('reply wrong', '"reply_to_message_id": reply_to', '"reply_to_message_id": 0'),
-        ('allow without reply dropped', '"allow_sending_without_reply": "true", ', ''),
+        ('allow without reply restored', '"caption": MD_ZIP_CAPTION',
+         '"allow_sending_without_reply": "true", "caption": MD_ZIP_CAPTION'),
         ('ZIP growth guard removed', 'if len(data) > BOT_API_UPLOAD_LIMIT:', 'if False:'),
         ('ZIP growth guard exclusive boundary', 'if len(data) > BOT_API_UPLOAD_LIMIT:',
          'if len(data) >= BOT_API_UPLOAD_LIMIT:'),
@@ -72,7 +80,7 @@ def mutations(source):
         yield name, source[:start] + replace_once(helper, old, new) + source[end:]
 
     # A valid encoder sent before the verdict must also be detected.
-    start = source.index('        if send_md:\n')
+    start = source.index('        if send_md or md_error is not None:\n')
     end = source.index('\n\ndef main():', start)
     block = source[start:end]
     without = source[:start] + source[end:]

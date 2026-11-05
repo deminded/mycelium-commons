@@ -329,7 +329,7 @@ def api(method, **params):
 def send_document(chat_id, path, filename, reply_to, thread_id=None):
     """Upload a bounded ZIP using stdlib multipart; api() is form-urlencoded."""
     params = {"chat_id": chat_id, "reply_to_message_id": reply_to,
-              "allow_sending_without_reply": "true", "caption": MD_ZIP_CAPTION}
+              "caption": MD_ZIP_CAPTION}
     if thread_id:
         params["message_thread_id"] = thread_id
     boundary = "mycelium-" + secrets.token_hex(24)
@@ -523,12 +523,17 @@ def handle_file(msg):
             label["llm_triage"] = tri.get("status", "SKIPPED")
         archive = qdest + ".md.zip"
         send_md = False
-        if os.path.exists(archive):
-            if os.path.getsize(archive) <= BOT_API_UPLOAD_LIMIT:
-                send_md = True
-                tri_line += "\n📝 md-версия приложена ниже"
-            else:
-                tri_line += "\n📝 md-версия больше 50 МБ, в чат не отправлена"
+        md_error = None
+        try:
+            if os.path.exists(archive):
+                if os.path.getsize(archive) <= BOT_API_UPLOAD_LIMIT:
+                    send_md = True
+                    tri_line += "\n📝 md-версия приложена ниже"
+                else:
+                    tri_line += "\n📝 md-версия больше 50 МБ, в чат не отправлена"
+        except Exception as exc:
+            # Defer attachment failures until the main verdict has been sent.
+            md_error = exc
         try:
             with open(lbl_dst, "w", encoding="utf-8") as f:
                 json.dump(label, f, ensure_ascii=False, indent=2)
@@ -542,8 +547,10 @@ def handle_file(msg):
               f"(cookbook-agent §8). sha256 {str(label.get('sha256'))[:16]}…" + tri_line,
               reply_to=msg_id, thread_id=thread_id)
 
-        if send_md:
+        if send_md or md_error is not None:
             try:
+                if md_error is not None:
+                    raise md_error
                 result = send_document(chat_id, archive, safe_name(name) + ".md.zip",
                                        msg_id, thread_id=thread_id)
                 if not result.get("ok"):

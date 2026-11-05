@@ -44,6 +44,23 @@ def scenario(source, size=None, failure=None, thread=True, loop=False, reject=Fa
             message['message_thread_id'] = 91
         events = []
         requests = []
+        stat_failed = failure in ('getsize-error', 'zip-vanished', 'exists-error')
+        real_exists = module.os.path.exists
+        real_getsize = module.os.path.getsize
+
+        def exists(path):
+            if str(path).endswith('.md.zip') and failure == 'exists-error':
+                raise OSError('archive stat failed')
+            return real_exists(path)
+
+        def getsize(path):
+            if str(path).endswith('.md.zip'):
+                assert real_exists(path), 'archive must exist before getsize'
+                if failure == 'getsize-error':
+                    raise PermissionError('archive stat denied')
+                if failure == 'zip-vanished':
+                    Path(path).unlink()
+            return real_getsize(path)
 
         def download(file_id, path):
             assert file_id == 'file-id'
@@ -79,6 +96,18 @@ def scenario(source, size=None, failure=None, thread=True, loop=False, reject=Fa
             if failure in ('exception', 'notice-fails'):
                 # Never log urllib errors verbatim: they may contain the token URL.
                 raise OSError(module.API + '/sendDocument failed')
+            if failure == 'missing-reply':
+                content_type = req.get_header('Content-type')
+                parsed = BytesParser(policy=policy.default).parsebytes(
+                    b'Content-Type: ' + content_type.encode() + b'\r\n\r\n' + req.data)
+                fields = {part.get_param('name', header='content-disposition'):
+                          part.get_payload(decode=True) for part in parsed.iter_parts()}
+                # Model Telegram's missing-parent refusal, including the unsafe
+                # success fallback if a mutation restores allow_without_reply.
+                if fields.get('allow_sending_without_reply') == b'true':
+                    return io.BytesIO(b'{"ok": true}')
+                return io.BytesIO(json.dumps({'ok': False, 'error_code': 400,
+                    'description': 'Bad Request: message to be replied not found'}).encode())
             return io.BytesIO(json.dumps({'ok': failure != 'ok-false'}).encode())
 
         label = {'verdict': 'reject' if reject else 'quarantine', 'av': 'clean',
@@ -88,6 +117,8 @@ def scenario(source, size=None, failure=None, thread=True, loop=False, reject=Fa
                 mock.patch.object(module, 'triage', side_effect=triage), \
                 mock.patch.object(module, 'api', side_effect=api), \
                 mock.patch.object(module, 'accepted_formats_hint', return_value=' hint'), \
+                mock.patch.object(module.os.path, 'exists', side_effect=exists), \
+                mock.patch.object(module.os.path, 'getsize', side_effect=getsize), \
                 mock.patch.object(module.subprocess, 'run', return_value=types.SimpleNamespace(stdout=json.dumps(label))), \
                 mock.patch('urllib.request.urlopen', side_effect=urlopen), redirect_stdout(log):
             if loop:
@@ -99,6 +130,7 @@ def scenario(source, size=None, failure=None, thread=True, loop=False, reject=Fa
             else:
                 module.handle_file(message)
         messages = [e[1] for e in events if isinstance(e, tuple)]
+        # Keep the existing text-reply fallback; multipart documents require reply.
         for params in messages:
             assert params['chat_id'] == -100123
             assert params['reply_to_message_id'] == 7
@@ -112,13 +144,14 @@ def scenario(source, size=None, failure=None, thread=True, loop=False, reject=Fa
         assert quarantined.read_bytes() == b'original'
         assert json.loads(Path(str(quarantined) + '.safety.json').read_text())['verdict'] == 'quarantine'
         expected = BASE_TEXT
-        if size is not None:
+        if size is not None and not stat_failed:
             expected += ('\n📝 md-версия больше 50 МБ, в чат не отправлена' if size > LIMIT
                          else '\n📝 md-версия приложена ниже')
         assert messages[0]['text'] == expected, messages[0]['text']
-        sending = size is not None and size <= LIMIT
+        sending = size is not None and size <= LIMIT and not stat_failed
+        md_failed = stat_failed or (sending and failure is not None)
         assert len(requests) == int(sending)
-        assert len(messages) == 1 + int(sending and failure is not None)
+        assert len(messages) == 1 + int(md_failed)
         if sending:
             req = requests[0]
             content_type = req.get_header('Content-type')
@@ -130,10 +163,10 @@ def scenario(source, size=None, failure=None, thread=True, loop=False, reject=Fa
                 b'Content-Type: ' + content_type.encode() + b'\r\nMIME-Version: 1.0\r\n\r\n' + body)
             assert parsed.is_multipart() and not parsed.defects
             parts = list(parsed.iter_parts())
-            assert len(parts) == 5 + int(thread)
+            assert len(parts) == 4 + int(thread)
             fields = {p.get_param('name', header='content-disposition'): p for p in parts}
             expected_fields = {'chat_id': '-100123', 'reply_to_message_id': '7',
-                               'allow_sending_without_reply': 'true', 'caption': CAPTION}
+                               'caption': CAPTION}
             if thread:
                 expected_fields['message_thread_id'] = '91'
             assert set(fields) == set(expected_fields) | {'document'}
@@ -145,11 +178,15 @@ def scenario(source, size=None, failure=None, thread=True, loop=False, reject=Fa
             data = doc.get_payload(decode=True)
             assert len(data) == size
             assert data[:len(PAYLOAD)] == PAYLOAD[:size]
-        if sending and failure:
+        if md_failed:
             assert messages[1]['text'] == 'md-версию отправить не удалось'
             assert '[warn] sendDocument failed:' in log.getvalue(), log.getvalue()
             assert module.API not in log.getvalue(), 'token URL leaked'
             assert '[err] update' not in log.getvalue(), log.getvalue()
+            expected_error = {'getsize-error': 'PermissionError', 'zip-vanished': 'FileNotFoundError',
+                              'exists-error': 'OSError', 'missing-reply': 'RuntimeError'}.get(failure)
+            if expected_error:
+                assert f'[warn] sendDocument failed: {expected_error}' in log.getvalue(), log.getvalue()
         else:
             assert '[warn]' not in log.getvalue(), log.getvalue()
 
@@ -166,6 +203,10 @@ def cases():
         ('reject, unchanged path', dict(reject=True)),
         ('sendDocument exception + offset', dict(size=len(PAYLOAD), failure='exception', loop=True)),
         ('sendDocument ok=false + offset', dict(size=len(PAYLOAD), failure='ok-false', loop=True)),
+        ('missing original message refuses upload + offset', dict(size=len(PAYLOAD), failure='missing-reply', loop=True)),
+        ('getsize error preserves verdict + offset', dict(size=len(PAYLOAD), failure='getsize-error', loop=True)),
+        ('ZIP disappears before getsize + offset', dict(size=len(PAYLOAD), failure='zip-vanished', loop=True)),
+        ('exists error preserves verdict + offset', dict(size=len(PAYLOAD), failure='exists-error', loop=True)),
         ('failure notice also fails + offset', dict(size=len(PAYLOAD), failure='notice-fails', loop=True)),
     ]
 
