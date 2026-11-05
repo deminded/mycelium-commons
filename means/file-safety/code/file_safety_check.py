@@ -179,6 +179,9 @@ OOXML_GENERIC_TYPES = {"application/xml", "text/xml", "application/octet-stream"
 PNG_TAIL = b"\x00\x00\x00\x00IEND\xaeB`\x82"  # IEND chunk is always these 12 bytes
 JPEG_TAIL = b"\xff\xd9"                        # EOI marker
 GIF_TAIL = b";"                                # 0x3B trailer
+# WebP has no terminator marker, but its RIFF header states the payload length:
+# 'RIFF' + uint32 LE size + 'WEBP'. Bytes past size + 8 are the same channel.
+WEBP_RIFF_HEADER_LEN = 12
 
 # journal lives next to the worker by default — the same file works unchanged
 # on the dev host (~/file-safety/) and on mycelium (/opt/mycelium/file-safety/)
@@ -620,6 +623,20 @@ def ooxml_check(fd, is_docx):
     return (len(reasons) == 0), sorted(reasons)
 
 
+def webp_length_reasons(fd, size):
+    """Exact-length rule for WebP; no allowance for an odd RIFF pad byte,
+    because conformant encoders write even sizes and ambiguity is not allowed."""
+    head = os.pread(fd, WEBP_RIFF_HEADER_LEN, 0)
+    if len(head) < WEBP_RIFF_HEADER_LEN or head[:4] != b"RIFF" or head[8:12] != b"WEBP":
+        return ["webp_header_malformed"]
+    declared = int.from_bytes(head[4:8], "little") + 8
+    if size < declared:
+        return ["image_truncated"]
+    if size > declared:
+        return ["trailing_data_after_webp_terminator"]
+    return []
+
+
 def polyglot_check(fd, mime, size):
     """
     Codex review #3: `file` reports only the FIRST format it recognizes, so a
@@ -654,6 +671,8 @@ def polyglot_check(fd, mime, size):
             tail = os.pread(fd, len(tail_spec), size - len(tail_spec))
             if tail != tail_spec:
                 reasons.append(f"trailing_data_after_{mime.split('/')[1]}_terminator")
+    elif mime == "image/webp":
+        reasons.extend(webp_length_reasons(fd, size))
 
     return (len(reasons) == 0), reasons
 
