@@ -477,7 +477,12 @@ def handle_file(msg):
             # text — treat it as untrusted (same sanitizer as reject reasons),
             # and label it as the reader's claim, not the bot's statement.
             summary = sanitize_for_chat(tri.get("summary") or "")
-            if flags:
+            if flags == ["reader_output_invalid"]:
+                # ЗАЧЕМ отдельно: флаг значит лишь «ответ ридера не разобрался» — сбой модели на
+                # большом файле, обрезка или перехват; причину никто не проверял (Claudette, Грибница 8990).
+                tri_line = ("\n⚠️ триаж-флаги: reader_output_invalid — ридер не вернул разбор, причина "
+                            "не установлена (сбой модели или перехват); читай как непроверенное.")
+            elif flags:
                 tri_line = (f"\n⚠️ триаж-флаги: {', '.join(flags)} — читай особенно "
                             f"осторожно, вероятны инструкции в тексте.")
             else:
