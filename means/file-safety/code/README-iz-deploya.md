@@ -45,7 +45,14 @@ Exit code: `0` if verdict is `quarantine`, `1` if `reject`.
 - **Polyglots (#3):** any non-zip that also opens as a zip (valid EOCD the
   way any unzip finds it) → reject `polyglot_zip_signature`; PNG/JPEG/GIF
   with bytes after the format terminator (IEND/EOI/trailer) → reject
-  `trailing_data_after_*`. Ambiguity is not allowed through.
+  `trailing_data_after_*`; WebP (no terminator) is held to the length its
+  RIFF header declares: longer → `trailing_data_after_webp_terminator`,
+  shorter → `image_truncated`, not RIFF/WEBP → `webp_header_malformed` (#2407).
+  The whole input is rejected, nothing is trimmed. Ambiguity is not allowed through.
+  LIMIT: these guards close only the tail and zip-polyglot channels. A payload
+  inside the image's own blocks (PNG tEXt/private chunk, a WebP chunk whose
+  declared length was stretched over it, JPEG COM/APPn) passes for every image
+  type — that is why the verdict is quarantine, never "safe".
 
 ## What's NOT implemented yet
 

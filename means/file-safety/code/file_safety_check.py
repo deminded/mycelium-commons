@@ -624,8 +624,10 @@ def ooxml_check(fd, is_docx):
 
 
 def webp_length_reasons(fd, size):
-    """Exact-length rule for WebP; no allowance for an odd RIFF pad byte,
-    because conformant encoders write even sizes and ambiguity is not allowed."""
+    """Exact-length rule for WebP: the file must end where its RIFF header says.
+    Chunk padding lives inside that bound, so no extra pad byte is allowed after it.
+    This is not format validation and does not prove the absence of hidden data:
+    a sender can stretch a chunk's declared length over a payload (see README LIMIT)."""
     head = os.pread(fd, WEBP_RIFF_HEADER_LEN, 0)
     if len(head) < WEBP_RIFF_HEADER_LEN or head[:4] != b"RIFF" or head[8:12] != b"WEBP":
         return ["webp_header_malformed"]
