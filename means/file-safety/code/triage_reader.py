@@ -19,6 +19,7 @@ the reader emits none, and its output is re-validated structurally downstream.
 """
 import json
 import os
+import re
 import sys
 import urllib.request
 
@@ -27,6 +28,10 @@ KEY_FILE = "/opt/mycelium/fs-triage/.cauldron_key"
 MODEL = "glm-4.6"
 MAX_CHARS = 30_000          # head+tail budget; a bomb of text can't blow the context
 TIMEOUT = 75
+# The model reasons before it answers, and the reasoning is billed against the same budget.
+# With 500 the reasoning alone used all of it on any real document, the answer came back empty
+# and every converted file was labelled reader_output_invalid for eight days (#2522).
+MAX_TOKENS = 3000
 
 ALLOWED_FLAGS = {
     "imperative_to_reader", "role_override", "hidden_instructions",
@@ -72,7 +77,7 @@ def call_model(content):
             {"role": "user", "content": f"<<<FILE_CONTENT>>>\n{content}\n<<<END_FILE_CONTENT>>>"},
         ],
         "temperature": 0,
-        "max_tokens": 500,
+        "max_tokens": MAX_TOKENS,
     }).encode()
     req = urllib.request.Request(
         CAULDRON, data=body,
@@ -80,7 +85,8 @@ def call_model(content):
     )
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
         resp = json.load(r)
-    return resp["choices"][0]["message"]["content"]
+    choice = resp["choices"][0]
+    return choice["message"].get("content"), choice.get("finish_reason")
 
 
 def validate(model_text):
@@ -104,7 +110,12 @@ def main():
         return 0
     try:
         content = clip(read_target(sys.argv[1]))
-        result = validate(call_model(content))
+        model_text, finish = call_model(content)
+        result = validate(model_text)
+        if result["flags"] == ["reader_output_invalid"]:
+            # Goes into the file's label, not into chat: tells a spent budget ("length")
+            # from an answer that was given and did not parse.
+            result["finish_reason"] = re.sub(r"[^a-z_]", "", str(finish).lower())[:24]
     except Exception as e:
         # any failure reads as "not triaged", never as clean
         result = {"summary": "", "flags": ["triage_error:" + type(e).__name__]}
