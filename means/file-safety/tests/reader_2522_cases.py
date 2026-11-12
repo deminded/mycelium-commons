@@ -31,7 +31,8 @@ def run_reader(source, message, finish='stop', network_error=None):
 
         def urlopen(req, timeout):
             sent.append(req)
-            assert timeout == module.TIMEOUT
+            # literal on purpose: comparing with module.TIMEOUT would follow a wrong constant
+            assert timeout == 75, timeout
             if network_error is not None:
                 raise network_error
             return io.BytesIO(json.dumps(
@@ -53,7 +54,8 @@ def good_answer(source):
     assert result == {'summary': 'о чём файл', 'flags': ['role_override']}, result
     # the budget must leave room for the answer after the model's own reasoning (#2522):
     # with 500 the reasoning alone used all of it on any real document
-    assert body['max_tokens'] == module.MAX_TOKENS and module.MAX_TOKENS >= 2000, body['max_tokens']
+    # the exact value is the one tried on the server; a larger one also stretches the 75 s timeout
+    assert body['max_tokens'] == 3000 == module.MAX_TOKENS, body['max_tokens']
     assert body['model'] == module.MODEL and body['temperature'] == 0
 
 
@@ -74,6 +76,8 @@ def finish_reason_is_cleaned(source):
     result, _, _ = run_reader(source, {'content': ''}, finish='len"gth\n<b>' + 'x' * 80)
     assert result['flags'] == ['reader_output_invalid']
     assert result['finish_reason'] == ('lengthb' + 'x' * 80)[:24], result['finish_reason']
+    result, _, _ = run_reader(source, {'content': ''}, finish='content_filter')
+    assert result['finish_reason'] == 'content_filter', result
     result, _, _ = run_reader(source, {'content': ''}, finish=None)
     assert result['finish_reason'] == 'none', result
 

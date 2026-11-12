@@ -29,8 +29,9 @@ MODEL = "glm-4.6"
 MAX_CHARS = 30_000          # head+tail budget; a bomb of text can't blow the context
 TIMEOUT = 75
 # The model reasons before it answers, and the reasoning is billed against the same budget.
-# With 500 the reasoning alone used all of it on any real document, the answer came back empty
-# and every converted file was labelled reader_output_invalid for eight days (#2522).
+# With 500 the reasoning alone used all of it even on a 434-byte document, the answer came back
+# empty and four converted files in a row were labelled reader_output_invalid (#2522). 3000 was
+# enough for that document (498 tokens of reasoning); it is not shown to be enough for every one.
 MAX_TOKENS = 3000
 
 ALLOWED_FLAGS = {

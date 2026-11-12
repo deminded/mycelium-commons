@@ -8,6 +8,10 @@ from reader_2522_cases import SOURCE, run
 def mutations(source):
     replacements = [
         ('budget back to 500', 'MAX_TOKENS = 3000', 'MAX_TOKENS = 500'),
+        ('budget hundred times larger', 'MAX_TOKENS = 3000', 'MAX_TOKENS = 300000'),
+        ('budget not the tried one', 'MAX_TOKENS = 3000', 'MAX_TOKENS = 2000'),
+        ('request timeout ten times longer', 'TIMEOUT = 75', 'TIMEOUT = 750'),
+        ('underscore dropped from the reason', '[^a-z_]', '[^a-z]'),
         ('budget constant not used', '"max_tokens": MAX_TOKENS,', '"max_tokens": 500,'),
         ('missing content crashes', 'choice["message"].get("content")', 'choice["message"]["content"]'),
         ('reason not recorded', 'if result["flags"] == ["reader_output_invalid"]:', 'if False:'),
