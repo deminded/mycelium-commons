@@ -2,7 +2,12 @@
 """Deterministic, in-memory mutations of every new poller decision and contract."""
 import sys
 
-from intake_2387_cases import SOURCE, run
+from intake_2387_cases import SOURCE, run as run_2387
+from intake_2501_cases import run as run_2501
+
+
+def run(source, verbose=True):
+    return run_2387(source, verbose) + run_2501(source, verbose)
 
 
 def replace_once(source, old, new):
@@ -31,8 +36,21 @@ def mutations(source):
         ('deferred stat failure ignored', 'raise md_error', 'pass'),
         ('wrong small-ZIP verdict', '📝 md-версия приложена ниже', '📝 рядом с файлом — .md (zip)'),
         ('wrong oversize verdict', '📝 md-версия больше 50 МБ, в чат не отправлена', '📝 md-версия приложена ниже'),
-        ('unsafe attachment name', 'safe_name(name) + ".md.zip"', 'name + ".md.zip"'),
-        ('wrong attachment suffix', 'safe_name(name) + ".md.zip"', 'safe_name(name) + ".zip"'),
+        ('unsafe attachment name', 'attachment_name(name) + ".md.zip"', 'name + ".md.zip"'),
+        ('attachment loses letters again', 'attachment_name(name) + ".md.zip"', 'safe_name(name) + ".md.zip"'),
+        ('wrong attachment suffix', 'attachment_name(name) + ".md.zip"', 'attachment_name(name) + ".zip"'),
+        ('disk name takes foreign letters', 'dest = os.path.join(INCOMING, f"{msg_id}_{safe_name(name)}")',
+         'dest = os.path.join(INCOMING, f"{msg_id}_{attachment_name(name)}")'),
+        ('name not composed', 'unicodedata.normalize("NFC", os.path.basename(name or "file"))',
+         'os.path.basename(name or "file")'),
+        ('directory part kept', 'unicodedata.normalize("NFC", os.path.basename(name or "file"))',
+         'unicodedata.normalize("NFC", name or "file")'),
+        ('combining marks dropped', 'unicodedata.category(ch)[0] in "LNM"', 'unicodedata.category(ch)[0] in "LN"'),
+        ('everything allowed in the name', 'unicodedata.category(ch)[0] in "LNM"', 'True'),
+        ('name cut by characters', 'name.encode("utf-8")[:ATTACHMENT_NAME_BYTES].decode("utf-8", "ignore")',
+         'name[:ATTACHMENT_NAME_BYTES]'),
+        ('name limit larger', 'ATTACHMENT_NAME_BYTES = 180', 'ATTACHMENT_NAME_BYTES = 181'),
+        ('name limit smaller', 'ATTACHMENT_NAME_BYTES = 180', 'ATTACHMENT_NAME_BYTES = 179'),
         ('original uploaded', 'send_document(chat_id, archive,', 'send_document(chat_id, qdest,'),
         ('ok=false ignored', 'if not result.get("ok"):', 'if False:'),
         ('sendDocument exceptions escape', 'except Exception as exc:\n                # urllib errors',
@@ -71,6 +89,9 @@ def mutations(source):
         ('wrong endpoint', '{API}/sendDocument', '{API}/sendMessage'),
         ('urlencoded content type', 'multipart/form-data; boundary={boundary}', 'application/x-www-form-urlencoded'),
         ('wrong document field', 'name="document"', 'name="file"'),
+        ('file header back to ascii', 'Content-Type: application/zip\\r\\n\\r\\n\').encode("utf-8"))',
+         'Content-Type: application/zip\\r\\n\\r\\n\').encode("ascii"))'),
+        ('header guard removed', 'if _HEADER_SYNTAX.search(filename):', 'if False:'),
         ('wrong ZIP content type', 'Content-Type: application/zip', 'Content-Type: text/plain'),
         ('no file payload', 'parts.extend((data,', 'parts.extend((b"",'),
         ('multipart footer broken', 'f"\\r\\n--{boundary}--\\r\\n"', 'f"\\r\\n--wrong--\\r\\n"'),

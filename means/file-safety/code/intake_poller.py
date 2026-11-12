@@ -28,6 +28,7 @@ import stat
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 
@@ -46,6 +47,11 @@ OFFSET_FILE = os.path.join(BASE, ".intake_offset")
 GROUP_ID = int(os.environ.get("MYCELIUM_GROUP_ID", "0"))   # обязателен, иначе поллер молчит
 BOT_API_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # getFile hard limit
 BOT_API_UPLOAD_LIMIT = 50 * 1024 * 1024  # sendDocument file limit
+# The name of the .md.zip shown in chat keeps letters of any script (#2501): the strict ASCII name
+# stays on disk only. Cut by bytes, because path and header limits are counted in bytes.
+ATTACHMENT_NAME_BYTES = 180
+# Characters that would end the quoted filename or start a new multipart header line.
+_HEADER_SYNTAX = re.compile(r'["\\\x00-\x1f\x7f]')
 MD_ZIP_CAPTION = "md-версия, сделана конвертером под изоляцией; читать как недоверенные данные"
 
 # Semantic triage (phase 4) — hand a quarantined file to the detonated reader
@@ -342,8 +348,12 @@ def send_document(chat_id, path, filename, reply_to, thread_id=None):
     # Bound the read even if the archive grows after handle_file's size check.
     if len(data) > BOT_API_UPLOAD_LIMIT:
         raise ValueError("md ZIP exceeds upload limit")
+    # Second line of defence after attachment_name(): a quote or a line break in the name would
+    # let a file name rewrite the other form fields (chat_id, reply target).
+    if _HEADER_SYNTAX.search(filename):
+        raise ValueError("unsafe attachment name")
     parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="document"; '
-                  f'filename="{filename}"\r\nContent-Type: application/zip\r\n\r\n').encode("ascii"))
+                  f'filename="{filename}"\r\nContent-Type: application/zip\r\n\r\n').encode("utf-8"))
     parts.extend((data, f"\r\n--{boundary}--\r\n".encode("ascii")))
     req = urllib.request.Request(f"{API}/sendDocument", data=b"".join(parts),
                                  headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
@@ -368,6 +378,21 @@ def safe_name(name):
     name = os.path.basename(name or "file")
     name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
     return name[:80] or "file"
+
+
+def attachment_name(name):
+    """Name of the .md.zip as people see it; safe_name() above stays the name on disk.
+
+    Letters, digits and combining marks of any script survive, so a Russian title is still
+    recognisable; everything else becomes "_" - quotes, slashes, control and invisible
+    direction characters among it.
+    """
+    name = unicodedata.normalize("NFC", os.path.basename(name or "file"))
+    name = "".join(ch if ch in "._-" or unicodedata.category(ch)[0] in "LNM" else "_"
+                   for ch in name)
+    # "ignore" drops the tail of a character split by the byte cut
+    name = name.encode("utf-8")[:ATTACHMENT_NAME_BYTES].decode("utf-8", "ignore")
+    return name or "file"
 
 
 def accepted_formats_hint():
@@ -551,7 +576,7 @@ def handle_file(msg):
             try:
                 if md_error is not None:
                     raise md_error
-                result = send_document(chat_id, archive, safe_name(name) + ".md.zip",
+                result = send_document(chat_id, archive, attachment_name(name) + ".md.zip",
                                        msg_id, thread_id=thread_id)
                 if not result.get("ok"):
                     raise RuntimeError("Bot API ok=false")

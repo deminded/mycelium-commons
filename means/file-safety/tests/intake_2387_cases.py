@@ -173,7 +173,8 @@ def scenario(source, size=None, failure=None, thread=True, loop=False, reject=Fa
             for name, value in expected_fields.items():
                 assert fields[name].get_payload(decode=True).decode() == value
             doc = fields['document']
-            assert doc.get_filename() == 'bad______.pdf.md.zip', doc.get_filename()
+            # the attachment keeps the letters of the original name (#2501); the copy on disk above does not
+            assert doc.get_filename() == 'bad___имя.pdf.md.zip', doc.get_filename()
             assert doc.get_content_type() == 'application/zip'
             data = doc.get_payload(decode=True)
             assert len(data) == size
