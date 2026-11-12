@@ -1,0 +1,16 @@
+{
+  "_comment": "Example only: build the matcher from your own inventory of outgoing tools; include file-sending tools such as Artifact where applicable.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|WebFetch|WebSearch|Artifact|mcp__.*__(reply|send|publish|upload)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /path/to/secret-outgoing-check/code/hook_pretooluse.py"
+          }
+        ]
+      }
+    ]
+  }
+}
