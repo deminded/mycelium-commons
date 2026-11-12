@@ -52,6 +52,10 @@ BOT_API_UPLOAD_LIMIT = 50 * 1024 * 1024  # sendDocument file limit
 ATTACHMENT_NAME_BYTES = 180
 # Characters that would end the quoted filename or start a new multipart header line.
 _HEADER_SYNTAX = re.compile(r'["\\\x00-\x1f\x7f]')
+# Code points that Unicode files under letters or marks but that have no visible glyph of their
+# own (fillers, joiner, variation selectors): two different names would look the same on screen.
+_INVISIBLE = re.compile("[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u180f\u3164\uffa0"
+                        "\ufe00-\ufe0f\U000e0100-\U000e01ef]")
 MD_ZIP_CAPTION = "md-версия, сделана конвертером под изоляцией; читать как недоверенные данные"
 
 # Semantic triage (phase 4) — hand a quarantined file to the detonated reader
@@ -388,6 +392,7 @@ def attachment_name(name):
     direction characters among it.
     """
     name = unicodedata.normalize("NFC", os.path.basename(name or "file"))
+    name = _INVISIBLE.sub("_", name)
     name = "".join(ch if ch in "._-" or unicodedata.category(ch)[0] in "LNM" else "_"
                    for ch in name)
     # "ignore" drops the tail of a character split by the byte cut

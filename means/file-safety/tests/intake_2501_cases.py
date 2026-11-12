@@ -12,6 +12,7 @@ NAME_LIMIT = 180  # bytes of UTF-8 for the base name; the ".md.zip" suffix is ad
 # (title, raw name from Telegram, expected attachment base name)
 NAMES = [
     ('russian name survives, space becomes underscore', 'Отчёт за ноябрь.pdf', 'Отчёт_за_ноябрь.pdf'),
+    ('digits survive', 'invoice2026 №7.pdf', 'invoice2026__7.pdf'),
     ('decomposed letters are composed', 'Отчёт.pdf', 'Отчёт.pdf'),
     ('quote and line breaks are removed, letters stay', '../bad"\r\nимя.pdf', 'bad___имя.pdf'),
     ('backslash is not a path here and is removed', 'a\\b.txt', 'a_b.txt'),
@@ -20,6 +21,11 @@ NAMES = [
     ('control characters are removed', 'a\x00b\x1fc\x7f.txt', 'a_b_c_.txt'),
     ('lone surrogate does not break encoding', 'a\ud800b.txt', 'a_b.txt'),
     ('combining vowel signs of other scripts stay', 'हिंदी.pdf', 'हिंदी.pdf'),
+    ('filler that looks like nothing is removed', 'report\u3164.pdf', 'report_.pdf'),
+    ('second filler', 'report\u115f\u1160\uffa0.pdf', 'report___.pdf'),
+    ('invisible joiner is removed', 'report\u034f.pdf', 'report_.pdf'),
+    ('variation selectors are removed', 'report\ufe0f\ufe00\U000e0100.pdf', 'report___.pdf'),
+    ('other invisible marks', 'a\u17b4\u17b5\u180b\u180d\u180f.txt', 'a_____.txt'),
     ('only forbidden characters is still a name', '"""', '___'),
     ('empty name', '', 'file'),
     ('missing name', None, 'file'),
@@ -58,8 +64,11 @@ def header_cases(module):
         wanted = 'name="document"; filename="Отчёт_за_ноябрь.pdf.md.zip"\r\n'.encode('utf-8')
         assert sent[0].data.count(wanted) == 1, 'russian file name must travel as UTF-8 in the header'
         # header syntax in the name is refused before any network call
-        for bad in ('a".md.zip', 'a\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n1.md.zip',
-                    'a\nb.md.zip', 'a\\b.md.zip', 'a\x00b.md.zip'):
+        # every forbidden character on its own: a combined example would hide a guard that misses one
+        forbidden = [chr(i) for i in range(32)] + ['\x7f', '"', '\\']
+        assert len(forbidden) == 35
+        for bad in (['a\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n1.md.zip']
+                    + ['a' + ch + 'b.md.zip' for ch in forbidden]):
             with mock.patch('urllib.request.urlopen', side_effect=AssertionError('unsafe name uploaded')) as net:
                 try:
                     module.send_document(-100123, str(path), bad, 7)
