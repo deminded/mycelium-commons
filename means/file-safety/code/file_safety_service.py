@@ -111,10 +111,15 @@ def _write_probe(directory):
     """Исход попытки создать файл. Создание удалось — это уже запись, что бы ни случилось с
     уборкой: сбой unlink не должен читаться как запрет (ревью p2-r2, P2-R2-1)."""
     probe = os.path.join(directory, ".isolation-probe-%d" % os.getpid())
-    created = _outcome(lambda: os.close(os.open(
+    fds = []
+    created = _outcome(lambda: fds.append(os.open(
         probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)))
-    cleanup = _outcome(lambda: os.unlink(probe)) if created == "allowed" else "not-needed"
-    return created, cleanup
+    if created != "allowed":
+        return created, "not-needed"
+    # Исход решён на open: файл создан. Ошибка close не превращает запись в запрет и не отменяет
+    # попытку удалить файл (ревью p2-r3, P2-R3-1) — оба шага только диагностика уборки.
+    return created, {"close": _outcome(lambda: os.close(fds[0])),
+                     "unlink": _outcome(lambda: os.unlink(probe))}
 
 
 def _create(family):

@@ -4,6 +4,7 @@
 держат то, что от песочницы не зависит: протокол, отказ на кривом входе, тот же ярлык,
 что у проверяльщика, уборку частного каталога. Изоляцию меряет проба после установки.
 """
+import errno
 import gzip
 import hashlib
 import importlib.util
@@ -248,10 +249,9 @@ REQUIRED = {
     "Environment": "PATH=/usr/bin:/bin LANG=C.UTF-8",
     "ExecStart": "/usr/bin/python3 -I -B /opt/file-safety/file_safety_service.py",
 }
-# Меняют смысл обещанного: чужая учётка, возврат путей и /run, недобивание потомков.
-FORBIDDEN = {"User", "Group", "SupplementaryGroups", "AmbientCapabilities", "ReadWritePaths", "BindPaths",
-             "BindReadOnlyPaths", "PrivateUsers", "Restart", "KillMode", "SendSIGKILL", "Delegate",
-             "ExecStartPre", "ExecStartPost", "ExecStop", "PermissionsStartOnly"}
+# Закрытый перечень: чёрный список пропускал то, о чём не подумали (FinalKillSignal, ревью p2-r3,
+# P3-R3-1). Новый ключ в юните — только вместе с правкой этого договора.
+UNIT_KEYS = {("Unit", "Description"), ("Unit", "CollectMode")} | {("Service", k) for k in REQUIRED}
 
 
 def _unit_settings(path):
@@ -260,20 +260,42 @@ def _unit_settings(path):
         line = line.strip()
         if not line or line.startswith(("#", ";")):
             continue
+        # Продолжение строки systemd склеивает, а этот разбор нет: отказ лучше другого прочтения.
+        assert not line.endswith("\\"), line
         if line.startswith("["):
-            section = line.strip("[]")
+            section = line[1:-1].strip()
             continue
-        key, _, value = line.partition("=")
-        pairs.setdefault((section, key), []).append(value)
+        key, sep, value = line.partition("=")
+        assert sep, line
+        # Пробелы вокруг '=' systemd допускает (systemd.syntax): «ProtectHome =no» — тот же ключ.
+        pairs.setdefault((section, key.strip()), []).append(value.strip())
     return pairs
 
 
-def test_unit_keeps_every_hardening_option():
-    s = _unit_settings(UNIT)
+def _check_unit(path):
+    s = _unit_settings(path)
     for key, value in REQUIRED.items():
         assert s.get(("Service", key)) == [value], (key, s.get(("Service", key)))
-    assert not {k for (_, k) in s} & FORBIDDEN, {k for (_, k) in s} & FORBIDDEN
-    assert {sec for (sec, _) in s} == {"Unit", "Service"}
+    assert set(s) == UNIT_KEYS, set(s) ^ UNIT_KEYS
+
+
+def test_unit_keeps_every_hardening_option():
+    _check_unit(UNIT)
+
+
+@pytest.mark.parametrize("extra", [
+    "ProtectHome =no",                    # тот же ключ с пробелом — второе значение для systemd
+    "BindReadOnlyPaths =/run:/host-run",  # /run хоста обратно под другим именем
+    "FinalKillSignal=SIGCONT",            # SendSIGKILL послал бы его вместо SIGKILL
+    "KillMode=process",
+    "ProtectHome=yes \\",                 # продолжение строки
+])
+def test_unit_contract_catches_weakening(tmp_path, extra):
+    text = UNIT.read_text(encoding="utf-8").replace("TimeoutStopSec=5\n", "TimeoutStopSec=5\n%s\n" % extra)
+    bad = tmp_path / UNIT.name
+    bad.write_text(text, encoding="utf-8")
+    with pytest.raises(AssertionError):
+        _check_unit(bad)
 
 
 def test_socket_unit_is_private_to_the_agent():
@@ -310,7 +332,8 @@ def test_probe_returns_raw_outcomes_without_verdict(tmp_path):
     assert r["unix:" + ctl] == "allowed" and r["unix:" + d + "/nope"] == "error:ENOENT"
     # ожидание — с самого хоста: проба должна пробовать, а не повторять заготовленный ответ
     assert r["inet"] == "allowed" and r["inet6"] == m._outcome(lambda: m._create(socket.AF_INET6))
-    assert r["code_write"] == "allowed" and out["code_write_cleanup"] == "allowed"
+    assert r["code_write"] == "allowed"
+    assert out["code_write_cleanup"] == {"close": "allowed", "unlink": "allowed"}
     assert not list(CODE.glob(".isolation-probe-*"))
     assert "isolated" not in out and out["uid"] == os.getuid() and out["gid"] == os.getgid()
 
@@ -411,7 +434,7 @@ def test_write_probe_counts_creation_even_if_cleanup_fails(tmp_path, monkeypatch
     monkeypatch.setattr(m.os, "unlink", no_unlink)
     created, cleanup = m._write_probe(str(tmp_path))
     monkeypatch.undo()
-    assert (created, cleanup) == ("allowed", "error:EPERM")
+    assert (created, cleanup) == ("allowed", {"close": "allowed", "unlink": "error:EPERM"})
     assert list(tmp_path.glob(".isolation-probe-*"))
 
 
@@ -424,3 +447,68 @@ def test_write_probe_denied_creation(tmp_path):
         assert m._write_probe(str(d)) == ("error:EACCES", "not-needed")
     finally:
         d.chmod(0o700)
+
+
+# --- круг 4: находки ревью p2-r3 (~/reviews/isolate-2559-20261113/review-astra-r3/REVIEW-astra-r3.md)
+
+def _failing_probe_close(monkeypatch, m, err):
+    # close падает только на файле пробы: остальные fd процесса закрываются как обычно
+    real_close, held = os.close, []
+
+    def close(fd):
+        if ".isolation-probe-" in os.readlink("/proc/self/fd/%d" % fd):
+            held.append(fd)
+            raise OSError(err, os.strerror(err))
+        real_close(fd)
+    monkeypatch.setattr(m.os, "close", close)
+    return real_close, held
+
+
+@pytest.mark.parametrize("err", [errno.EPERM, errno.EACCES, errno.EROFS])
+def test_write_probe_counts_creation_even_if_close_fails(tmp_path, monkeypatch, err):
+    m = _module()
+    real_close, held = _failing_probe_close(monkeypatch, m, err)
+    try:
+        created, cleanup = m._write_probe(str(tmp_path))
+    finally:
+        monkeypatch.undo()
+        for fd in held:
+            real_close(fd)
+    name = errno.errorcode[err]
+    assert (created, cleanup) == ("allowed", {"close": "error:" + name, "unlink": "allowed"})
+    assert not list(tmp_path.glob(".isolation-probe-*"))   # сбой close не отменил удаление
+
+
+def test_close_failure_after_creation_is_judged_as_leak(tmp_path, monkeypatch):
+    m = _module()
+    control = tmp_path / "control.env"
+    control.write_text("x")
+    real_close, held = _failing_probe_close(monkeypatch, m, errno.EROFS)
+    try:
+        reply = m.isolation_probe({"files": [str(control)], "unix": []})
+    finally:
+        monkeypatch.undo()
+        for fd in held:
+            real_close(fd)
+    assert reply["results"]["code_write"] == "allowed"
+    verdict = _client().judge(reply, [str(control)], [], static=set())
+    assert verdict["checks"]["code_write"] == "LEAK" and verdict["isolated"] is False
+    assert not list(CODE.glob(".isolation-probe-*"))
+
+
+def test_static_uids_reads_real_passwd_file(tmp_path):
+    cli = _client()
+    p = tmp_path / "passwd"
+    p.write_text("root:x:0:0:root:/root:/bin/bash\n"
+                 "svc:x:61234:61234:static in the dynamic range:/:/usr/sbin/nologin\n"
+                 "broken line\n"
+                 "short:x:7\n", encoding="utf-8")
+    static = cli.static_uids(str(p))
+    assert static == {0, 61234}
+    assert cli.static_uids(str(tmp_path / "missing")) is None
+    assert cli.static_uids(str(tmp_path)) is None   # каталог вместо файла
+    base = {"code_write": "error:EROFS", "inet": "error:EAFNOSUPPORT", "inet6": "error:EAFNOSUPPORT",
+            "file:/c": "error:ENOENT"}
+    for uid, want in ((61234, "unproven"), (61235, "blocked")):
+        v = cli.judge({"uid": uid, "results": base}, ["/c"], [], static=static)
+        assert v["checks"]["uid"] == want, (uid, v)
