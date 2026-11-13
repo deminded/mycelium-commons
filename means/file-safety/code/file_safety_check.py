@@ -24,6 +24,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat as stat_mod
 import subprocess
@@ -233,7 +234,18 @@ def detect_mime_fd(fd):
 # ---------------------------------------------------------------------------
 
 def mime_allowed(mime):
-    if mime in MIME_WHITELIST_EXACT:
+    # Окружение читается заново: настройка одного вызова не расширяет последующие.
+    extra = set()
+    for item in os.environ.get("FILE_SAFETY_MIME_EXTRA", "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if re.fullmatch(r"[a-z0-9.+-]+/[a-z0-9.+-]+", item):
+            extra.add(item)
+        else:
+            print(f"FILE_SAFETY_MIME_EXTRA: некорректный MIME {item!r}, пропущен",
+                  file=sys.stderr)
+    if mime in MIME_WHITELIST_EXACT or mime in extra:
         return True
     return any(mime.startswith(p) for p in MIME_WHITELIST_PREFIXES)
 
