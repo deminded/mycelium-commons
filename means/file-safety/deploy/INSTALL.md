@@ -42,13 +42,24 @@ sudo systemctl daemon-reload
    (из `../code/`).
 2. Проба изоляции — мерить песочницу, а не юнит-файл:
    `python3 /opt/file-safety/file_safety_client.py probe --file <файл секретов> --file <файл в доме>
+   --file /run/systemd/resolve/resolv.conf
    --unix /run/systemd/resolve/io.systemd.Resolve --unix /run/dbus/system_bus_socket`
    Клиент сперва сам читает каждый контрольный файл и соединяется с каждым сокетом (не смог — rc 2,
    проба не доказательна). rc 0 — только если внутри экземпляра все они скрыты или запрещены,
-   AF_INET и AF_INET6 не создаются, каталог кода не пишется и uid из диапазона DynamicUser.
-3. Живые образцы через `check`: EICAR → reject; текст, docx, ogg, mp4 → те же вердикты,
+   AF_INET и AF_INET6 не создаются, каталог кода не пишется, uid из диапазона DynamicUser
+   и его нет в `/etc/passwd`.
+   Какая преграда чем меряется: `--unix` кончается на `socket()` и показывает только запрет
+   создавать сокеты — до пути дело не доходит. Скрытие `/run` хоста меряет `--file
+   /run/systemd/resolve/resolv.conf`: обычный файл 644, агенту читается, внутри экземпляра должен
+   дать ENOENT.
+3. Что systemd прочёл из установленного юнита:
+   `systemctl show -p DynamicUser,ProtectHome,PrivateNetwork,RestrictAddressFamilies,TemporaryFileSystem file-safety@probe.service`
+   (ожидается `DynamicUser=yes`, `ProtectHome=yes`, `PrivateNetwork=yes`). Это настройка, а не
+   применение: применённое показывает только проба из шага 2 — uid экземпляра из диапазона
+   DynamicUser и не из `/etc/passwd`.
+4. Живые образцы через `check`: EICAR → reject; текст, docx, ogg, mp4 → те же вердикты,
    что у нынешнего гейта.
-4. Переключить агента: `TRACT_FILE_SAFETY_MODE=socket` в окружении тракта, перезапуск тракта.
+5. Переключить агента: `TRACT_FILE_SAFETY_MODE=socket` в окружении тракта, перезапуск тракта.
 
 ## Пределы
 
@@ -57,7 +68,8 @@ sudo systemctl daemon-reload
 - Смерть тракта не гасит начатый скан сразу: экземпляр в своей cgroup доживает до конца
   или до остановки на 160-й секунде.
 - Файловые сокеты хоста (resolved, D-Bus, mysqld — открыты всем) закрыты дважды: службе
-  запрещено создавать сокеты вовсе, и `/run` хоста ей не виден. Проба это меряет.
+  запрещено создавать сокеты через `socket()`, и `/run` хоста ей не виден. Обе преграды проба
+  меряет порознь (шаг 2). `socketpair()` первый запрет не ловит — потому `/run` и скрыт.
 - `MemoryDenyWriteExecute` не включён: без стенда не проверено, переживёт ли его libclamav.
 - Динамический uid читает то, что открыто всем вне `/home` и `/tmp` (`/etc`, `/opt`, `/var`).
   Сверено 13.11.2026 поиском по именам (`*.env*`, `*secret*`, `*token*`, `*.session`, `*.key`, `*.pem`)
