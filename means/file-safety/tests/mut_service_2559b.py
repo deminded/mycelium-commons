@@ -29,6 +29,13 @@ MUTS = [
     ("unit", "ProtectHome=no", "ProtectHome=yes", "ProtectHome=no"),
     ("unit", "сокеты хоста открыты", "RestrictAddressFamilies=none", "RestrictAddressFamilies=AF_UNIX"),
     ("unit", "/run хоста виден", "TemporaryFileSystem=/run:ro\n", ""),
+    ("svc", "уборка решает исход записи", "    return created, cleanup\n", '    return (cleanup if created == "allowed" else created), cleanup\n'),
+    ("cli", "uid из /etc/passwd не сверяется", " and static is not None and uid not in static", ""),
+    ("unit", "TimeoutStopSec=90", "TimeoutStopSec=5", "TimeoutStopSec=90"),
+    ("unit", "KillMode=process", "TimeoutStopSec=5\n", "TimeoutStopSec=5\nKillMode=process\n"),
+    ("unit", "/run обратно через bind", "TemporaryFileSystem=/run:ro\n", "TemporaryFileSystem=/run:ro\nBindReadOnlyPaths=/run:/host-run\n"),
+    ("unit", "ProtectProc=default", "ProtectProc=invisible", "ProtectProc=default"),
+    ("unit", "MemoryMax снят", "MemoryMax=1800M\n", ""),
 ]
 
 

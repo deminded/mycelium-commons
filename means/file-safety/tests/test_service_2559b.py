@@ -238,37 +238,49 @@ REQUIRED = {
     "DynamicUser": "yes", "ProtectHome": "yes", "ProtectSystem": "strict", "PrivateTmp": "yes",
     "PrivateNetwork": "yes", "PrivateDevices": "yes", "PrivateIPC": "yes", "NoNewPrivileges": "yes",
     "RestrictAddressFamilies": "none", "TemporaryFileSystem": "/run:ro", "CapabilityBoundingSet": "",
-    "RestrictNamespaces": "yes", "RestrictSUIDSGID": "yes", "SystemCallArchitectures": "native",
-    "SystemCallFilter": "@system-service", "NoExecPaths": "/tmp /var/tmp", "RuntimeMaxSec": "160",
-    "StandardInput": "socket", "StandardOutput": "socket", "UMask": "0077",
+    "RestrictNamespaces": "yes", "RestrictSUIDSGID": "yes", "RestrictRealtime": "yes",
+    "LockPersonality": "yes", "ProtectHostname": "yes", "ProtectClock": "yes",
+    "ProtectKernelTunables": "yes", "ProtectKernelModules": "yes", "ProtectKernelLogs": "yes",
+    "ProtectControlGroups": "yes", "ProtectProc": "invisible", "SystemCallArchitectures": "native",
+    "SystemCallFilter": "@system-service", "SystemCallErrorNumber": "EPERM", "NoExecPaths": "/tmp /var/tmp",
+    "RuntimeMaxSec": "160", "TimeoutStopSec": "5", "MemoryMax": "1800M", "TasksMax": "16", "CPUQuota": "100%",
+    "StandardInput": "socket", "StandardOutput": "socket", "StandardError": "journal", "UMask": "0077",
+    "Environment": "PATH=/usr/bin:/bin LANG=C.UTF-8",
     "ExecStart": "/usr/bin/python3 -I -B /opt/file-safety/file_safety_service.py",
 }
-FORBIDDEN = {"User", "Group", "SupplementaryGroups", "AmbientCapabilities", "ReadWritePaths",
-             "BindPaths", "PrivateUsers", "Restart"}
+# Меняют смысл обещанного: чужая учётка, возврат путей и /run, недобивание потомков.
+FORBIDDEN = {"User", "Group", "SupplementaryGroups", "AmbientCapabilities", "ReadWritePaths", "BindPaths",
+             "BindReadOnlyPaths", "PrivateUsers", "Restart", "KillMode", "SendSIGKILL", "Delegate",
+             "ExecStartPre", "ExecStartPost", "ExecStop", "PermissionsStartOnly"}
 
 
 def _unit_settings(path):
-    pairs = {}
+    pairs, section = {}, None
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
-        if not line or line.startswith(("#", ";", "[")):
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("["):
+            section = line.strip("[]")
             continue
         key, _, value = line.partition("=")
-        pairs.setdefault(key, []).append(value)
+        pairs.setdefault((section, key), []).append(value)
     return pairs
 
 
 def test_unit_keeps_every_hardening_option():
     s = _unit_settings(UNIT)
     for key, value in REQUIRED.items():
-        assert s.get(key) == [value], (key, s.get(key))
-    assert not FORBIDDEN & set(s), FORBIDDEN & set(s)
+        assert s.get(("Service", key)) == [value], (key, s.get(("Service", key)))
+    assert not {k for (_, k) in s} & FORBIDDEN, {k for (_, k) in s} & FORBIDDEN
+    assert {sec for (sec, _) in s} == {"Unit", "Service"}
 
 
 def test_socket_unit_is_private_to_the_agent():
     s = _unit_settings(SOCKET_UNIT)
-    assert s["ListenStream"] == ["/run/file-safety.sock"] and s["SocketMode"] == ["0600"]
-    assert s["SocketUser"] == ["claude-user"] and s["Accept"] == ["yes"] and s["MaxConnections"] == ["1"]
+    assert s[("Socket", "ListenStream")] == ["/run/file-safety.sock"] and s[("Socket", "SocketMode")] == ["0600"]
+    assert s[("Socket", "SocketUser")] == ["claude-user"] and s[("Socket", "Accept")] == ["yes"]
+    assert s[("Socket", "MaxConnections")] == ["1"]
 
 
 # --- проба изоляции: служба отдаёт сырые исходы, судит клиент (ревью p2-r1, P2-3)
@@ -298,7 +310,8 @@ def test_probe_returns_raw_outcomes_without_verdict(tmp_path):
     assert r["unix:" + ctl] == "allowed" and r["unix:" + d + "/nope"] == "error:ENOENT"
     # ожидание — с самого хоста: проба должна пробовать, а не повторять заготовленный ответ
     assert r["inet"] == "allowed" and r["inet6"] == m._outcome(lambda: m._create(socket.AF_INET6))
-    assert r["code_write"] == "allowed" and not list(CODE.glob(".isolation-probe-*"))
+    assert r["code_write"] == "allowed" and out["code_write_cleanup"] == "allowed"
+    assert not list(CODE.glob(".isolation-probe-*"))
     assert "isolated" not in out and out["uid"] == os.getuid() and out["gid"] == os.getgid()
 
 
@@ -340,6 +353,8 @@ def _blocked(files, unix=(), uid=DYN, **results):
     ({"uid": 0}, 1, "unproven"),
     ({"uid": 995}, 1, "unproven"),                # статический системный uid вместо динамического
     ({"uid": True}, 1, "unproven"),
+    ({"uid": 61235}, 1, "unproven"),             # uid из диапазона, но есть в /etc/passwd (подложен ниже)
+    ({"uid": 70000}, 1, "unproven"),             # не статический, но и не из диапазона DynamicUser
 ])
 def test_client_probe_judges_each_check(tmp_path, capsys, change, rc, check):
     f = tmp_path / "control.env"
@@ -351,8 +366,10 @@ def test_client_probe_judges_each_check(tmp_path, capsys, change, rc, check):
     results = {("file:" + str(f) if k == "FILE" else "unix:" + ctl if k == "UNIX" else k): v
                for k, v in change.items()}
     srv = Inetd(tmp_path, canned=_blocked([str(f)], [ctl], uid=uid, **results))
+    cli = _client()
+    cli.static_uids = lambda path="/etc/passwd": {0, 995, os.getuid(), 61235}
     try:
-        got = _client().main(["probe", "--socket", srv.path, "--file", str(f), "--unix", ctl])
+        got = cli.main(["probe", "--socket", srv.path, "--file", str(f), "--unix", ctl])
     finally:
         srv.close()
         listener.close()
@@ -384,3 +401,26 @@ def test_client_probe_error_reply_is_not_isolated(tmp_path, capsys):
         assert _client().main(["probe", "--socket", srv.path, "--file", str(f)]) == 1
     finally:
         srv.close()
+
+
+def test_write_probe_counts_creation_even_if_cleanup_fails(tmp_path, monkeypatch):
+    m = _module()
+
+    def no_unlink(path, *a, **k):
+        raise PermissionError(1, "unlink denied")
+    monkeypatch.setattr(m.os, "unlink", no_unlink)
+    created, cleanup = m._write_probe(str(tmp_path))
+    monkeypatch.undo()
+    assert (created, cleanup) == ("allowed", "error:EPERM")
+    assert list(tmp_path.glob(".isolation-probe-*"))
+
+
+def test_write_probe_denied_creation(tmp_path):
+    m = _module()
+    d = tmp_path / "ro"
+    d.mkdir()
+    d.chmod(0o500)
+    try:
+        assert m._write_probe(str(d)) == ("error:EACCES", "not-needed")
+    finally:
+        d.chmod(0o700)

@@ -107,11 +107,14 @@ def _read(path):
         os.close(fd)
 
 
-def _write_in(directory):
+def _write_probe(directory):
+    """Исход попытки создать файл. Создание удалось — это уже запись, что бы ни случилось с
+    уборкой: сбой unlink не должен читаться как запрет (ревью p2-r2, P2-R2-1)."""
     probe = os.path.join(directory, ".isolation-probe-%d" % os.getpid())
-    fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    os.close(fd)
-    os.unlink(probe)
+    created = _outcome(lambda: os.close(os.open(
+        probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)))
+    cleanup = _outcome(lambda: os.unlink(probe)) if created == "allowed" else "not-needed"
+    return created, cleanup
 
 
 def _create(family):
@@ -138,14 +141,17 @@ def _probe_paths(header, key):
 
 def isolation_probe(header):
     files, unix = _probe_paths(header, "files"), _probe_paths(header, "unix")
-    results = {"code_write": _outcome(lambda: _write_in(HERE)),
+    write, cleanup = _write_probe(HERE)
+    results = {"code_write": write,
                "inet": _outcome(lambda: _create(socket.AF_INET)),
                "inet6": _outcome(lambda: _create(socket.AF_INET6))}
     for p in files:
         results["file:" + p] = _outcome(lambda p=p: _read(p))
     for p in unix:
         results["unix:" + p] = _outcome(lambda p=p: _unix_connect(p))
-    return {"probe": "isolation", "uid": os.getuid(), "gid": os.getgid(), "results": results}
+    # cleanup — диагностика, не проверка: клиент его не судит
+    return {"probe": "isolation", "uid": os.getuid(), "gid": os.getgid(), "results": results,
+            "code_write_cleanup": cleanup}
 
 
 def main():

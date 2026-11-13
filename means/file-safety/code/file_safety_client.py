@@ -55,7 +55,16 @@ def precheck(files, unix):
             s.close()
 
 
-def judge(reply, files, unix):
+def static_uids(path="/etc/passwd"):
+    """uid статических учёток: попавший сюда uid экземпляра — не динамический, даже из диапазона."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return {int(p[2]) for p in (line.split(":") for line in f) if len(p) >= 7 and p[2].isdigit()}
+    except OSError:
+        return None
+
+
+def judge(reply, files, unix, static=None):
     res = reply.get("results") if isinstance(reply.get("results"), dict) else {}
 
     def kind(key, blocked):
@@ -74,7 +83,7 @@ def judge(reply, files, unix):
     uid = reply.get("uid")
     # статический пользователь с тем же именем занял бы место динамического — uid должен это показать
     checks["uid"] = ("blocked" if type(uid) is int and uid in DYNAMIC_UIDS and uid != os.getuid()
-                     else "unproven")
+                     and static is not None and uid not in static else "unproven")
     return {"isolated": bool(files) and all(v == "blocked" for v in checks.values()), "checks": checks}
 
 
@@ -130,7 +139,7 @@ def main(argv=None):
             print(json.dumps({"isolated": None, "not_conclusive": str(e)}, ensure_ascii=False))
             return 2
         out = exchange(a.socket, {"v": 1, "probe": "isolation", "files": a.file, "unix": a.unix})
-        verdict = judge(out, a.file, a.unix)
+        verdict = judge(out, a.file, a.unix, static_uids())
         print(json.dumps({"reply": out, "verdict": verdict}, ensure_ascii=False, indent=2))
         return 0 if verdict["isolated"] else 1
     if len(a.args) != 1:
