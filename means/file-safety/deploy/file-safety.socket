@@ -1,0 +1,15 @@
+[Unit]
+Description=Attachment safety check for the agent (socket, #2559)
+
+[Socket]
+ListenStream=/run/file-safety.sock
+# Only the agent account may submit files: anyone who can connect gets a scan with our CPU and memory.
+SocketUser=claude-user
+SocketGroup=claude-user
+SocketMode=0600
+Accept=yes
+# One clamscan (~1 GB of signatures) at a time is what the host memory allows; the agent serializes too.
+MaxConnections=1
+
+[Install]
+WantedBy=sockets.target

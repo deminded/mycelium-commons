@@ -1,0 +1,47 @@
+[Unit]
+Description=Attachment safety check, one connection (#2559)
+CollectMode=inactive-or-failed
+
+[Service]
+ExecStart=/usr/bin/python3 -I -B /opt/file-safety/file_safety_service.py
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+Environment=PATH=/usr/bin:/bin LANG=C.UTF-8
+
+# Why: the parsers (libmagic, zipfile/XML, libclamav) eat files from strangers. An exploit here must
+# land in a throwaway uid with no home, no network, a private /tmp and a hard lifetime.
+DynamicUser=yes
+UMask=0077
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# Borrowed from fs-triage-worker on the Mycelium host: a dropped binary must not be runnable.
+NoExecPaths=/tmp /var/tmp
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateIPC=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+LockPersonality=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# The agent gives up at 150 s; the scan must not outlive it for long, even if the agent itself was killed.
+RuntimeMaxSec=160
+TimeoutStopSec=5
+MemoryMax=1800M
+TasksMax=16
+CPUQuota=100%
