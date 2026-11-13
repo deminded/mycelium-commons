@@ -12,7 +12,10 @@ file-safety@.service: динамический uid, без /home, без сет�
   запрос: строка JSON до HEADER_MAX байт с "\\n" в конце
             {"v": 1, "name": "<путь у агента>", "size": N, "mime_extra": ["audio/ogg", ...]}
           и ровно N байт следом;
-          или {"v": 1, "probe": "isolation", "paths": [...]} — самопроверка песочницы.
+          или {"v": 1, "probe": "isolation", "files": [...], "unix": [...]} — сырые исходы
+          попыток прочесть файлы, соединиться с unix-сокетами, создать AF_INET/AF_INET6 и
+          записать в каталог кода; что из этого запрет, судит клиент.
+  Обрабатываются ровно N байт тела; хвост сверх N не читается и вторым запросом не считается.
   ответ:  одна строка JSON — ярлык file_safety_check, где "file" = name;
           {"error": "..."} — нарушение протокола или сбой проверки.
 Код возврата агенту не нужен: он читает только ответ.
@@ -32,8 +35,6 @@ CHUNK = 1 << 16
 NAME_MAX = 1024
 MIME_EXTRA_MAX = 16
 PROBE_PATHS_MAX = 8
-# Адрес без DNS: проба должна мерить запрет сети, а не работу резолвера.
-PROBE_CONNECT = ("1.1.1.1", 53)
 MIME_RE = re.compile(r"^[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*$")
 
 
@@ -55,7 +56,8 @@ def _read_header(inp):
         header = json.loads(line)
     except (ValueError, UnicodeDecodeError):
         raise ProtocolError("header_not_json")
-    if not isinstance(header, dict) or header.get("v") != 1:
+    # type is int: True и 1.0 равны 1 в Python, но это не версия протокола
+    if not isinstance(header, dict) or type(header.get("v")) is not int or header["v"] != 1:
         raise ProtocolError("header_version")
     return header
 
@@ -87,24 +89,22 @@ def _receive(inp, size, path):
             left -= len(chunk)
 
 
-def _attempt(action):
+def _outcome(action):
+    # Сырой исход без толкования: что считать запретом, решает клиент — только он знает,
+    # что контрольный путь существует и открыт ему самому (иначе ENOENT ничего не доказывает).
     try:
         action()
-    except TimeoutError:
-        # тишина — не запрет: пакет мог уйти и потеряться
-        return "timeout"
     except OSError as e:
-        return "denied:" + errno.errorcode.get(e.errno, str(e.errno))
+        return "error:" + (errno.errorcode.get(e.errno, str(e.errno)) if e.errno else type(e).__name__)
     return "allowed"
 
 
-def _list(path):
-    os.listdir(path)
-
-
 def _read(path):
-    with open(path, "rb") as f:
-        f.read(1)
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        os.read(fd, 1)
+    finally:
+        os.close(fd)
 
 
 def _write_in(directory):
@@ -114,28 +114,38 @@ def _write_in(directory):
     os.unlink(probe)
 
 
-def _connect():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def _create(family):
+    # Создание сокета, без соединения: запрет семейства мерится без выхода наружу.
+    socket.socket(family, socket.SOCK_STREAM).close()
+
+
+def _unix_connect(path):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        s.settimeout(3)
-        s.connect(PROBE_CONNECT)
+        s.settimeout(2)
+        s.connect(path)
     finally:
         s.close()
 
 
-def isolation_probe(header):
-    paths = header.get("paths", [])
+def _probe_paths(header, key):
+    paths = header.get(key, [])
     if (not isinstance(paths, list) or len(paths) > PROBE_PATHS_MAX
             or not all(isinstance(p, str) and p.startswith("/") and "\0" not in p for p in paths)):
-        raise ProtocolError("bad_probe_paths")
-    checks = {"code_write": _attempt(lambda: _write_in(HERE)),
-              "net_connect": _attempt(_connect)}
-    for p in paths:
-        checks["read:" + p] = _attempt(
-            (lambda p=p: _list(p)) if os.path.isdir(p) else (lambda p=p: _read(p)))
-    uid = os.getuid()
-    return {"probe": "isolation", "uid": uid, "checks": checks,
-            "isolated": uid != 0 and all(v.startswith("denied:") for v in checks.values())}
+        raise ProtocolError("bad_probe_" + key)
+    return paths
+
+
+def isolation_probe(header):
+    files, unix = _probe_paths(header, "files"), _probe_paths(header, "unix")
+    results = {"code_write": _outcome(lambda: _write_in(HERE)),
+               "inet": _outcome(lambda: _create(socket.AF_INET)),
+               "inet6": _outcome(lambda: _create(socket.AF_INET6))}
+    for p in files:
+        results["file:" + p] = _outcome(lambda p=p: _read(p))
+    for p in unix:
+        results["unix:" + p] = _outcome(lambda p=p: _unix_connect(p))
+    return {"probe": "isolation", "uid": os.getuid(), "gid": os.getgid(), "results": results}
 
 
 def main():

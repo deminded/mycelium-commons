@@ -21,7 +21,12 @@ NoExecPaths=/tmp /var/tmp
 PrivateDevices=yes
 PrivateNetwork=yes
 PrivateIPC=yes
-RestrictAddressFamilies=AF_UNIX
+# The connection arrives already open (StandardInput=socket); the service creates no sockets at all.
+# AF_UNIX would leave host file sockets reachable: systemd-resolved and the D-Bus system bus resolve
+# names on request, which is a way out around PrivateNetwork (review #2559 p2-r1, sockets o+w in /run).
+RestrictAddressFamilies=none
+# Second layer for the same class: no host sockets or runtime state are visible at all.
+TemporaryFileSystem=/run:ro
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

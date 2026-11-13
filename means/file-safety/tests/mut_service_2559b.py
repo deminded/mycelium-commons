@@ -3,7 +3,8 @@ import os, shutil, subprocess, sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-FILES = {"svc": HERE.parent / "code/file_safety_service.py", "cli": HERE.parent / "code/file_safety_client.py"}
+FILES = {"svc": HERE.parent / "code/file_safety_service.py", "cli": HERE.parent / "code/file_safety_client.py",
+         "unit": HERE.parent / "deploy/file-safety@.service"}
 MUTS = [
     ("svc", "bool как размер", "or isinstance(size, bool) ", ""),
     ("svc", "длина заголовка не мерится", ' or len(line) > HEADER_MAX', ""),
@@ -11,12 +12,23 @@ MUTS = [
     ("svc", "короткое тело — молча", '                raise ProtocolError("short_body")', "                break"),
     ("svc", "предел размера снят", "        if size > fsc.MAX_FILE_SIZE_BYTES:\n", "        if False:\n"),
     ("svc", "частный каталог не убран", "            shutil.rmtree(workdir, ignore_errors=True)", "            pass"),
-    ("svc", "тишина сети — запрет", '        return "timeout"', '        return "denied:timeout"'),
     ("svc", "сбой разбора — пустой ответ", '_reply({"error": "check_failed:%s" % type(e).__name__})', "_reply({})"),
     ("svc", "mime_extra не доходит", 'os.environ["FILE_SAFETY_MIME_EXTRA"] = ",".join(extra)', "pass"),
     ("svc", "относительный путь пробы", ' and p.startswith("/")', ""),
-    ("cli", "проба: uid не сверяется", ' and out.get("uid") != os.getuid()', ""),
+    ("svc", "v=true как версия", 'type(header.get("v")) is not int or ', ""),
+    ("svc", "проба не пробует AF_INET6", '"inet6": _outcome(lambda: _create(socket.AF_INET6))', '"inet6": "error:EAFNOSUPPORT"'),
     ("cli", "check: ошибка = успех", ' and "error" not in out', ""),
+    ("cli", "пустой список контрольных файлов", '    if not files:\n        raise NotConclusive', '    if False:\n        raise NotConclusive'),
+    ("cli", "контрольный файл не предпроверен", '            raise NotConclusive("контрольный файл недоступен', '            continue\n            raise NotConclusive("контрольный файл недоступен'),
+    ("cli", "uid вне диапазона DynamicUser", "uid in DYNAMIC_UIDS and ", ""),
+    # «uid совпал с моим» не ставится: uid агента (1000) вне диапазона DynamicUser, условие
+    # подчинено проверке диапазона — порча равносильна исходнику; держится как явное намерение.
+    ("cli", "ECONNREFUSED — скрытие", 'HIDDEN | {"EAFNOSUPPORT"}', 'HIDDEN | {"EAFNOSUPPORT", "ECONNREFUSED"}'),
+    ("cli", "любая ошибка — запрет", 'v[len("error:"):] in blocked', "True"),
+    ("cli", "allowed — не утечка", '            return "LEAK"', '            return "blocked"'),
+    ("unit", "ProtectHome=no", "ProtectHome=yes", "ProtectHome=no"),
+    ("unit", "сокеты хоста открыты", "RestrictAddressFamilies=none", "RestrictAddressFamilies=AF_UNIX"),
+    ("unit", "/run хоста виден", "TemporaryFileSystem=/run:ro\n", ""),
 ]
 
 
