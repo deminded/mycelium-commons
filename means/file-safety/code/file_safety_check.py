@@ -216,7 +216,8 @@ SVG_CHUNK = 64 * 1024
 SVG_SNIFF_BYTES = 64 * 1024
 SVG_LINK_EDGE_CHARS = "".join(map(chr, range(0x21)))
 SVG_CSS_EXTERNAL_TOKENS = ("@import", "image-set(", "image(", "src(", "cross-fade(")
-SVG_CSS_LOCAL_URL = re.compile(r"""\s*(['"]?)(#[^\s'")]*?)\1\s*\)""")
+# CSS leaves non-CSS whitespace in the address, where it can hide a relative path.
+SVG_CSS_LOCAL_URL = re.compile(r"""[ \t\n\r\f]*(['"]?)#[^\s'"()]*\1[ \t\n\r\f]*\)""")
 
 # journal lives next to the worker by default — the same file works unchanged
 # on the dev host (~/file-safety/) and on mycelium (/opt/mycelium/file-safety/)
@@ -766,21 +767,8 @@ def _svg_css_has_external(value):
     value = value.lower()
     if any(token in value for token in SVG_CSS_EXTERNAL_TOKENS):
         return True
-    fragment_end = 0
-    quoted = False
-    for token in re.finditer(r"url\(", value):
-        if token.start() < fragment_end:
-            # Reuse the validated suffix of an unquoted fragment to keep
-            # the scan linear when the fragment name itself contains "url(".
-            if quoted or value[token.end():token.end() + 1] != "#":
-                return True
-            continue
-        fragment = SVG_CSS_LOCAL_URL.match(value, token.end())
-        if fragment is None:
-            return True
-        fragment_end = fragment.end(2)
-        quoted = bool(fragment[1])
-    return False
+    return any(SVG_CSS_LOCAL_URL.match(value, token.end()) is None
+               for token in re.finditer(r"url\(", value))
 
 
 class _SvgScan:
@@ -850,8 +838,8 @@ class _SvgScan:
 
 def svg_check(fd):
     """Check the SVG allowlist on the original descriptor and fail closed."""
-    scan = _SvgScan()
     try:
+        scan = _SvgScan()
         parser = _svg_parser(encoding="UTF-8")
         parser.XmlDeclHandler = scan.xml_decl
         parser.StartElementHandler = scan.start
@@ -860,29 +848,32 @@ def svg_check(fd):
         parser.ProcessingInstructionHandler = scan.processing_instruction
         parser.buffer_text = True
 
-        chunk = os.pread(fd, SVG_CHUNK, 0)
-        if chunk.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
-            raise _Refuse("svg_encoding_not_utf8")
-        # Without a BOM Expat can autodetect UTF-16 even when given "UTF-8".
-        # Pin its input encoding without changing the declaration or file bytes.
-        parser.Parse(codecs.BOM_UTF8, False)
-        if chunk.startswith(codecs.BOM_UTF8):
-            chunk = chunk[len(codecs.BOM_UTF8):]
-            offset = len(chunk) + len(codecs.BOM_UTF8)
-        else:
-            offset = len(chunk)
-        while chunk:
-            parser.Parse(chunk, False)
-            chunk = os.pread(fd, SVG_CHUNK, offset)
-            offset += len(chunk)
-        parser.Parse(b"", True)
-    except _Refuse as refusal:
-        scan.reasons.add(str(refusal))
-    except xml.parsers.expat.ExpatError:
-        scan.reasons.add("svg_xml_malformed")
+        try:
+            chunk = os.pread(fd, SVG_CHUNK, 0)
+            if chunk.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+                raise _Refuse("svg_encoding_not_utf8")
+            # Without a BOM Expat can autodetect UTF-16 even when given "UTF-8".
+            # Pin its input encoding without changing the declaration or file bytes.
+            parser.Parse(codecs.BOM_UTF8, False)
+            if chunk.startswith(codecs.BOM_UTF8):
+                chunk = chunk[len(codecs.BOM_UTF8):]
+                offset = len(chunk) + len(codecs.BOM_UTF8)
+            else:
+                offset = len(chunk)
+            while chunk:
+                parser.Parse(chunk, False)
+                chunk = os.pread(fd, SVG_CHUNK, offset)
+                offset += len(chunk)
+            parser.Parse(b"", True)
+        except _Refuse as refusal:
+            scan.reasons.add(str(refusal))
+        except xml.parsers.expat.ExpatError:
+            scan.reasons.add("svg_xml_malformed")
+        except Exception:
+            scan.reasons.add("svg_parse_error")
+        return not scan.reasons, sorted(scan.reasons)
     except Exception:
-        scan.reasons.add("svg_parse_error")
-    return not scan.reasons, sorted(scan.reasons)
+        return False, ["svg_parse_error"]
 
 
 def webp_length_reasons(fd, size):
@@ -1093,6 +1084,10 @@ def _check_open_file(path, fd, ts):
             if mime.startswith("text/") and sniff_svg_root(fd):
                 mime = SVG_MIME
             static_status, static_reasons = static_gate(fd, mime, size)
+            # An opener may infer SVG from the name even when sniffing missed it.
+            if mime != SVG_MIME and os.path.basename(path).rstrip(" .").lower().endswith(".svg"):
+                static_status = "reject"
+                static_reasons.append("svg_name_not_svg_content")
 
     # AV/LLM gates only make sense to run once static passes — no point
     # scanning something we're already rejecting on structural grounds.
