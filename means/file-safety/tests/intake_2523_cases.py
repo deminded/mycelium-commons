@@ -77,6 +77,8 @@ def technical_only(text, flags):
         assert flag in text, f'flag {flag} not shown'
     assert 'техническ' in text, 'not named as technical'
     assert 'непроверен' in text, 'does not say the file stays unverified'
+    # honest in both directions: a failed triage is no sign of an attack and no all-clear either
+    assert 'не подтверждает' in text, 'does not say that absence of instructions is unconfirmed'
 
 
 def suspicion_line(text):
@@ -153,6 +155,20 @@ def cases():
               {'summary': '', 'flags': ['triage_timeout'], 'finish_reason': 'length'},
               both(lambda t: technical_only(t, ['triage_timeout']),
                    lambda t: _eq('оборван по длине' not in t), no_raw('length'))))
+    # the implementer's report named these two branches as untested: the reason could be
+    # dropped there while single-flag cases stayed green (mutations M10, M11 survived)
+    add(check('reason kept among several technical flags',
+              {'summary': '', 'flags': ['reader_output_invalid', 'convert_cleanup_unknown'],
+               'finish_reason': 'length'},
+              both(lambda t: technical_only(t, ['reader_output_invalid', 'convert_cleanup_unknown']),
+                   lambda t: _eq('оборван по длине' in t), no_raw('length'))))
+    add(check('reason kept next to a content flag, outside the suspicion line',
+              {'summary': '', 'flags': ['role_override', 'reader_output_invalid'],
+               'finish_reason': 'content_filter'},
+              both(lambda t: _eq('role_override' in suspicion_line(t)),
+                   lambda t: _eq('reader_output_invalid' not in suspicion_line(t)),
+                   lambda t: _eq('фильтр' in t.replace(suspicion_line(t), '')),
+                   no_raw('content_filter'))))
     for bad in (123, ['length'], {'a': 1}, 'length' * 40, 'LENGTH', 'length '):
         add(check(f'finish_reason of a wrong shape {str(bad)[:14]!r}: unknown, no crash',
                   {'summary': '', 'flags': ['reader_output_invalid'], 'finish_reason': bad},
