@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """#2411 §4.3: метка image/svg+xml уходит на смысловой разбор как текст, без конвертации;
 подсказка о форматах при отказе по типу называет image/svg+xml.
+Редакция 3 требований (после ревью круга 1 и подсадок): в очередь разбора попадают те же байты; прочие
+image/… по-прежнему SKIPPED:non_textual; подсказка называет весь белый список, а не один новый тип.
 
 Запуск: python3 tests/intake_svg_cases.py [путь к intake_poller.py]
 По умолчанию — code/intake_poller.py рядом с tests/. Без сети, токена, fs-triage и боевых каталогов:
@@ -33,8 +35,9 @@ def load():
     return module
 
 
-def triage_case(mime):
-    """Hand-off model of md_convert_cases.intake_case: the worker answers at once in the outbox."""
+def triage_case(mime, skipped=False):
+    """Hand-off model of md_convert_cases.intake_case: the worker answers at once in the outbox.
+    skipped=True expects no hand-off at all: the type stays out of the semantic reading."""
     intake = load()
     with tempfile.TemporaryDirectory(prefix="intake-2411-") as tmp:
         root = Path(tmp)
@@ -47,13 +50,19 @@ def triage_case(mime):
         qpath = root / "quarantined.svg"
         qpath.write_bytes(SVG_BYTES)
         actual_rename = os.rename
-        kinds = []
+        kinds, queued = [], []
 
         def handoff(src, dest, **kwargs):
             if str(dest) == qpath.name and kwargs.get("dst_dir_fd") is not None:
                 # A ".kind" file next to the task is how conversion is ordered (md_convert_cases.py).
                 kinds.append((inbox / ("." + qpath.name + ".kind")).exists())
                 actual_rename(src, dest, **kwargs)
+                # Ed. 3: what the worker will read is the file as it landed in the queue, not the source.
+                task_fd = os.open(dest, os.O_RDONLY, dir_fd=kwargs["dst_dir_fd"])
+                try:
+                    queued.append(os.read(task_fd, 1 << 20))
+                finally:
+                    os.close(task_fd)
                 (outbox / (qpath.name + ".json")).write_text(json.dumps({"summary": "ok", "flags": []}))
             else:
                 actual_rename(src, dest, **kwargs)
@@ -65,15 +74,26 @@ def triage_case(mime):
             result = intake.triage(str(qpath), mime)
         intact = qpath.read_bytes() == SVG_BYTES
         archive = (root / (qpath.name + ".md.zip")).exists()
-    good = (kinds == [False] and isinstance(result, dict) and result.get("summary") == "ok"
-            and result.get("status") != "SKIPPED:non_textual" and "converted" not in result
-            and intact and not archive)
-    got = f"передач={len(kinds)} kind={kinds} результат={result!r} исходник цел={intact} md.zip={archive}"
+    if skipped:
+        good = kinds == [] and result == {"status": "SKIPPED:non_textual"} and intact and not archive
+    else:
+        good = (kinds == [False] and isinstance(result, dict) and result.get("summary") == "ok"
+                and result.get("status") != "SKIPPED:non_textual" and "converted" not in result
+                and intact and not archive and queued == [SVG_BYTES])
+    got = (f"передач={len(kinds)} kind={kinds} результат={result!r} исходник цел={intact} md.zip={archive} "
+           f"байты в очереди равны исходным={queued == [SVG_BYTES]}")
     return good, got
 
 
-def hint_case():
-    """Reject by type through handle_file; the hint itself is not replaced."""
+# The gate's whitelist as it stood on main before #2411, in the hint's own spelling ("text/" is shown as "text/*").
+OLD_KINDS = ["text/*", "image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf", "application/json",
+             "application/zip", "application/x-mimearchive", "message/rfc822",
+             "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]
+
+
+def hint_case(full=False):
+    """Reject by type through handle_file; the hint itself is not replaced.
+    full=True: the hint still names every type the gate accepted before SVG was added."""
     module = load()
     with tempfile.TemporaryDirectory(prefix="intake-2411-hint-") as tmp:
         root = Path(tmp)
@@ -101,8 +121,11 @@ def hint_case():
                 redirect_stdout(io.StringIO()):
             module.handle_file(message)
     hinted = [t for t in texts if "Принимаются" in t]
-    good = bool(hinted) and all(SVG_MIME in t for t in hinted)
-    return good, f"сообщений={len(texts)} с «Принимаются»={len(hinted)} текст={(hinted or texts or [''])[0][:300]!r}"
+    wanted = OLD_KINDS if full else [SVG_MIME]
+    missing = [kind for kind in wanted if not all(kind in t for t in hinted)]
+    good = bool(hinted) and not missing
+    return good, (f"сообщений={len(texts)} с «Принимаются»={len(hinted)} не названы={missing} "
+                  f"текст={(hinted or texts or [''])[0][:400]!r}")
 
 
 CASES = [
@@ -112,6 +135,12 @@ CASES = [
      "одна передача без kind, summary=ok, не SKIPPED:non_textual, без converted и md.zip"),
     ("§4.3: подсказка «Принимаются: …» при отказе по типу называет image/svg+xml", hint_case,
      "в сообщении с «Принимаются» есть image/svg+xml"),
+    ("§4.3 р3: подсказка называет и все прежние типы белого списка", lambda: hint_case(full=True),
+     "в сообщении с «Принимаются» названы все одиннадцать прежних типов"),
+] + [
+    (f"§4.3 р3: {mime} по-прежнему не идёт на смысловой разбор", lambda mime=mime: triage_case(mime, skipped=True),
+     "передач нет, результат {'status': 'SKIPPED:non_textual'}")
+    for mime in ("image/png", "image/jpeg", "image/gif", "image/webp")
 ]
 
 

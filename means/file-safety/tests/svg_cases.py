@@ -10,6 +10,8 @@ check_file зовёт живой `file` и clamscan: статику по зам�
 Нет точки входа или вызов бросил исключение — случай ПРОВАЛЕН, а не пропущен: пропуск прячет
 неисполнение. Строка на случай: ✓/✗, имя, что получено, что ждали; в конце ИТОГО, код 1 при провале.
 Ожидания — по SPEC.md редакции 2: решения раздела 8 закреплены, оставленное реализации не закрепляется.
+Редакция 3 меняет здесь ожидание одного случая check_file (правило имени, §4.1: спрятанный корень с именем
+на .svg теперь отказ) и добавляет ему соседа с именем .txt; всё прочее редакции 3 — в tests/svg_r3_cases.py.
 """
 import base64
 import gzip
@@ -841,8 +843,9 @@ LABEL_CASES = [
      SVG_MIME, "ok", "quarantine", [], None, ""),
     ("МАРШРУТ: чистый SVG с комментарием впереди (file: text/plain) идёт как SVG",
      svg(RECT, pre="<!-- diagram -->\n"), ".svg", "text/plain", SVG_MIME, "ok", "quarantine", [], None, ""),
-    ("ПРЕДЕЛ: комментарий + <!DOCTYPE x [ENTITY]> + svg идёт прежним маршрутом текста", COMMENT_DOCTYPE_X, ".svg",
-     "text/plain", "text/plain", "ok", "quarantine", None, no_svg_reasons, "нет причин svg_*"),
+    # Ed. 3: the hidden root is still not recognised; under a name that is not .svg the file keeps the text route.
+    ("ПРЕДЕЛ: комментарий + <!DOCTYPE x [ENTITY]> + svg с именем .txt идёт прежним маршрутом текста", COMMENT_DOCTYPE_X,
+     ".txt", "text/plain", "text/plain", "ok", "quarantine", None, no_svg_reasons, "нет причин svg_*"),
     ("§4.4 markdown с упоминанием <svg> — маршрут текста", MD_MENTION, ".md", "text/plain",
      "text/plain", "ok", "quarantine", None, no_svg_reasons, "нет причин svg_*"),
     ("СЛЕДСТВИЕ: не-SVG XML с объявлениями сущностей проходит как текст", XML_ENTITIES, ".xml", "text/xml",
@@ -851,6 +854,9 @@ LABEL_CASES = [
     ("СЛЕДСТВИЕ: HTML-страница с <svg> внутри — прежний маршрут (корень html)", HTML_SVG, ".html", "text/html",
      "text/html", None, None, None, no_svg_reasons, "нет причин svg_*"),
     # ---- fast: rejected by the static gate
+    # Ed. 3, the name rule: the same bytes named .svg were accepted as text by ed. 2 and are refused now.
+    ("ПРАВИЛО ИМЕНИ (ред. 3): комментарий + <!DOCTYPE x [ENTITY]> + svg с именем .svg — отказ", COMMENT_DOCTYPE_X, ".svg",
+     "text/plain", "text/plain", "reject", "reject", ["svg_name_not_svg_content"], None, ""),
     ("СЛЕДСТВИЕ: комментарий впереди + script (file: text/html) — теперь SVG и отказ",
      svg("<script>alert(1)</script>" + RECT, pre="<!-- diagram -->\n"), ".svg", "text/html",
      SVG_MIME, "reject", "reject", W(ELEM), None, ""),
