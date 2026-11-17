@@ -536,7 +536,10 @@ def handle_file(msg):
             summary = sanitize_for_chat(tri.get("summary") or "")
             # Technical failures must not become evidence of instructions in the file.
             content_flags = [f for f in flags if f.split(":", 1)[0] in RESULT_KNOWN_FLAGS]
-            technical_flags = [f for f in flags if f.split(":", 1)[0] not in RESULT_KNOWN_FLAGS]
+            # A content flag may have been evicted, so a rejection counter cannot reassure.
+            rejected_flags = [f for f in flags if f.split(":", 1)[0] == "result_flags_rejected"]
+            technical_flags = [f for f in flags if f.split(":", 1)[0] not in RESULT_KNOWN_FLAGS
+                               and f.split(":", 1)[0] != "result_flags_rejected"]
             reason = ""
             if "reader_output_invalid" in flags:
                 # Queue data is untrusted; only fixed explanations may reach the chat.
@@ -556,13 +559,16 @@ def handle_file(msg):
                 if content_flags:
                     tri_line = (f"\n⚠️ триаж-флаги: {', '.join(content_flags)} — читай особенно "
                                 "осторожно, вероятны инструкции в тексте.")
+                for flag in rejected_flags:
+                    tri_line += (f"\n⚠️ часть флагов ридера отброшена при приёме ({flag}): "
+                                 "что в них было, неизвестно — читай особенно осторожно.")
                 if technical_flags:
-                    if content_flags:
-                        tri_line += (f"\n⚙️ кроме того, разбор неполон: {', '.join(technical_flags)}"
-                                     f"{reason} — техническая ошибка.")
+                    if content_flags or rejected_flags:
+                        tri_line += (f"\n⚙️ кроме того, техническая ошибка обработки: "
+                                     f"{', '.join(technical_flags)}{reason}.")
                     else:
-                        tri_line = (f"\n⚙️ разбор не выполнен: {', '.join(technical_flags)}{reason} — "
-                                    "это техническая ошибка, не признак инструкций в тексте; "
+                        tri_line = (f"\n⚙️ техническая ошибка обработки: {', '.join(technical_flags)}{reason} — "
+                                    "это не признак инструкций в тексте; "
                                     "их отсутствия она тоже не подтверждает. Читай как непроверенное.")
             else:
                 tri_line = "\n🔍 триаж: явных инъекций не видно (НЕ гарантия — вектор остаётся)."
