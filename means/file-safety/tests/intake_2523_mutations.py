@@ -102,6 +102,15 @@ def mutations(source):
          'or flag.startswith(("convert_", "triage_", "reader_")))',
          'or flag.startswith(("convert_", "triage_", "reader_", "result_")))'),
         ('missing archive not reported', 'add_result_refusal(result, "convert_zip_rejected:missing")', 'pass'),
+        ('add_result_refusal drops the counter (review round 2)',
+         '    if rejected:' + chr(10) + '        result["flags"].append(',
+         '    if False:' + chr(10) + '        result["flags"].append('),
+        ('add_result_refusal evicts without counting', 'rejected += len(kept) - limit', 'pass'),
+        ('add_result_refusal forgets the counter it found',
+         'rejected = sum(int(f.split(":", 1)[1]) for f in flags if f.startswith("result_flags_rejected:"))',
+         'rejected = 0'),
+        # --- the verdict line: unchanged by this branch, pinned whole since review round 2 ---------
+        ('verdict line invents safety (review round 2)', 'содержимое семантически не проверено.', 'файл чист.'),
     ]
     for name, old, new in replacements:
         yield name, replace_once(source, old, new)

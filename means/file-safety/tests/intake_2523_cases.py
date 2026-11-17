@@ -35,6 +35,10 @@ OLD_INVALID = ('\n⚠️ триаж-флаги: reader_output_invalid — рид
 OLD_CLEAN = '\n🔍 триаж: явных инъекций не видно (НЕ гарантия — вектор остаётся).'
 REASON_LENGTH = ' (ответ ридера оборван по длине)'
 REASON_FILTER = ' (ответ остановлен фильтром поставщика модели)'
+# The verdict line, whole: SPEC promises it stays as it was, and a mutant that said "файл чист"
+# in it survived while only its prefix was compared (review round 2, P3).
+HEAD_LINE = ('📥 в карантине: static ok, av clean. Вердикт — quarantine, не «safe»: содержимое '
+             'семантически не проверено. Читать как недоверенные данные (cookbook-agent §8). sha256 abc…')
 SUMMARY_PREFIX = '\nридер о файле (не доверять как факту): '
 
 
@@ -169,7 +173,7 @@ def never_said(text):
 def check(name, tri, expected_tail, *extra, queue=None, stored_expected=None):
     def case(source):
         text, stored = run_case(source, tri=tri, queue=queue)
-        assert text.startswith('📥 в карантине: static ok, av clean.'), 'verdict line changed'
+        assert text.partition(chr(10))[0] == HEAD_LINE, 'verdict line changed'
         # the label keeps the whole triage result, whatever the chat says (review #2522 P3)
         want = stored_expected if stored_expected is not None else tri
         assert stored == want, f'label lost or changed triage data: {stored!r}'
@@ -343,6 +347,39 @@ def cases():
               None, full_technical(['convert_zip_rejected:missing']) + SUMMARY_PREFIX + 'Короткий пересказ',
               queue={'summary': 'Короткий пересказ', 'flags': [], 'converted': {'tool': 'pandoc'}},
               stored_expected={'summary': 'Короткий пересказ', 'flags': ['convert_zip_rejected:missing']}))
+    # add_result_refusal makes room for its own flag and for the counter; the set reached it only
+    # with an empty flag list, so a mutant that dropped the counter there survived (round 2, P2).
+    add(check('E2E: archive refusal at the cap evicts a content flag and says so',
+              None, rejected_line('result_flags_rejected:2')
+              + short_technical(['triage_timeout'] * 10 + ['convert_zip_rejected:missing']),
+              absent(NOT_A_SIGN, SUSPICION),
+              queue={'summary': '', 'flags': ['triage_timeout'] * 11 + ['role_override'], 'converted': {}},
+              stored_expected={'summary': '', 'flags': ['triage_timeout'] * 10
+                               + ['convert_zip_rejected:missing', 'result_flags_rejected:2']}))
+    add(check('E2E: archive refusal raises a counter that already exists',
+              None, rejected_line('result_flags_rejected:2')
+              + short_technical(['triage_timeout'] * 10 + ['convert_zip_rejected:missing']),
+              absent(NOT_A_SIGN, SUSPICION),
+              queue={'summary': '', 'flags': ['triage_timeout'] * 10 + ['role_override', 'bad flag'],
+                     'converted': {}},
+              stored_expected={'summary': '', 'flags': ['triage_timeout'] * 10
+                               + ['convert_zip_rejected:missing', 'result_flags_rejected:2']}))
+    add(check('E2E: archive refusal with room left evicts nothing and adds no rejected line',
+              None, content_line(['role_override'])
+              + short_technical(['triage_timeout'] * 10 + ['convert_zip_rejected:missing']),
+              absent('отброшена'),
+              queue={'summary': '', 'flags': ['triage_timeout'] * 10 + ['role_override'], 'converted': {}},
+              stored_expected={'summary': '', 'flags': ['triage_timeout'] * 10
+                               + ['role_override', 'convert_zip_rejected:missing']}))
+    # KNOWN LIMIT, pinned on purpose (review round 2, P2; SPEC "Известные пределы"): a result
+    # rejected as a whole never reaches the flag filter, so its flags vanish WITHOUT a counter and
+    # the person gets the full technical line. The line still says absence is unconfirmed and the
+    # file stays in quarantine. Changing this is a decision, not a refactoring — hence the case.
+    add(check('LIMIT: a result rejected as a whole loses its flags without a counter',
+              None, full_technical(['convert_zip_rejected:result_schema']),
+              lambda t: technical_only(t, ['convert_zip_rejected:result_schema']),
+              queue={'summary': [], 'flags': ['role_override']},
+              stored_expected={'summary': '', 'flags': ['convert_zip_rejected:result_schema']}))
     add(check('E2E: a counter planted in the queue is not trusted as the local one',
               None, rejected_line('result_flags_rejected:1'), absent(NOT_A_SIGN, '⚙️'),
               queue={'summary': '', 'flags': ['result_flags_rejected:9']},
