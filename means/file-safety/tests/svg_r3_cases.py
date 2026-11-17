@@ -225,13 +225,8 @@ def image_group():
 
 
 # ================================================================ svg_check never raises (§4.2)
-def boom(*_args, **_kwargs):
-    raise MemoryError("injected by the test")
-
-
 def robustness_group():
     print("== §4.2: ошибка самой проверки — отказ svg_parse_error, а не исключение ==")
-    allowed = ((True, []), (False, [B.PERR]))
 
     def body():
         fsc = B.FSC
@@ -243,9 +238,15 @@ def robustness_group():
         targets = [(fsc, n) for n, o in sorted(vars(fsc).items())
                    if inspect.isclass(o) and getattr(o, "__module__", None) == fsc.__name__]
         targets += [(xml.parsers.expat, "ParserCreate"), (os, "pread")]
-        outcomes, good = [], True
+        outcomes, good, hits = [], True, 0
         for owner, attr in targets:
-            def action(fd, path, owner=owner, attr=attr):
+            calls = []
+
+            def boom(*_args, _calls=calls, **_kwargs):
+                _calls.append(1)
+                raise MemoryError("injected by the test")
+
+            def action(fd, path, owner=owner, attr=attr, boom=boom):
                 with mock.patch.object(owner, attr, boom):
                     try:
                         ok, reasons = check(fd)
@@ -253,12 +254,15 @@ def robustness_group():
                     except BaseException as exc:
                         return f"ИСКЛЮЧЕНИЕ {type(exc).__name__}"
             result, intact = B.on_file(B.INKSCAPE, ".svg", action)
-            fine = intact and not isinstance(result, str) and tuple(result) in allowed
-            good &= fine
-            outcomes.append(f"{attr}: {result if isinstance(result, str) else tuple(result)}")
-        return good and bool(targets), "; ".join(outcomes)
+            # The swap bit only if the check really called it: then the answer must be the refusal;
+            # a swap the check never touched must leave the clean drawing accepted.
+            expected = (False, [B.PERR]) if calls else (True, [])
+            hits += bool(calls)
+            good &= intact and not isinstance(result, str) and tuple(result) == expected
+            outcomes.append(f"{attr} (вызовов {len(calls)}): {result if isinstance(result, str) else tuple(result)}")
+        return good and hits >= 2, "; ".join(outcomes)
     B.attempt("§4.2 р3: подмена каждого класса модуля, ParserCreate и os.pread на бросающий MemoryError",
-              f"каждый исход — (True, []) или (False, ['{B.PERR}']), исключений наружу нет", body)
+              f"где подмена была вызвана — (False, ['{B.PERR}']), где нет — (True, []); вызвано не меньше двух", body)
 
 
 # ================================================================ check_file: the name rule (§4.1, §4.5, §4.6)
@@ -266,6 +270,7 @@ SCRIPT_SVG = B.svg_str("<script>alert(1)</script>" + B.RECT)
 HID_DOCTYPE = ("<!-- diagram -->\n" + B.ENTITY_X + SCRIPT_SVG).encode("utf-8")
 HID_FAR = ('<?xml version="1.0"?>\n<!-- ' + "x" * 70000 + " -->\n" + SCRIPT_SVG).encode("utf-8")
 HID_SJIS = ('<?xml version="1.0" encoding="Shift_JIS"?>\n<!-- ' + "x" * 5000 + " -->\n" + SCRIPT_SVG).encode("ascii")
+FAR_CLEAN = ('<?xml version="1.0"?>\n<!-- ' + "x" * 70000 + " -->\n" + B.svg_str(B.RECT)).encode("utf-8")
 COMMENT_SCRIPT = B.svg("<script>alert(1)</script>" + B.RECT, pre="<!-- diagram -->\n")
 COMMENT_CLEAN = B.svg(B.RECT, pre="<!-- diagram -->\n")
 # (name, bytes, file name, what live `file` must say, label mime, static, verdict, exact reasons or None, check, text)
@@ -281,6 +286,8 @@ NAME_CASES = [
      "reject", "reject", [NAME], None, ""),
     ("ИМЯ: корень дальше 64 КиБ, внутри script, имя far.svg", HID_FAR, "far.svg", "text/xml", "text/xml", "reject",
      "reject", [NAME], None, ""),
+    ("ЛОЖНЫЙ ОТКАЗ, названный в §4.5: честный SVG с корнем дальше 64 КиБ и именем far-clean.svg", FAR_CLEAN,
+     "far-clean.svg", "text/xml", "text/xml", "reject", "reject", [NAME], None, ""),
     ("ИМЯ: объявлена Shift_JIS (expat не разбирает), внутри script, имя sjis.svg", HID_SJIS, "sjis.svg", "text/xml",
      "text/xml", "reject", "reject", [NAME], None, ""),
     ("ИМЯ: настоящий PNG с именем p.svg", B.PNG, "p.svg", "image/png", "image/png", "reject", "reject", [NAME], None, ""),
@@ -373,6 +380,50 @@ def name_group():
         return good, f"mime={label.get('mime')} static={label.get('static')} reasons={B.tail(reasons)}{journal_note}"
     B.attempt("ИМЯ: файл больше предела размера с именем big.svg — тип не определён, правило имени молчит",
               "static=reject, одна причина size_…, причины имени нет", oversize)
+
+    def untyped(kind):
+        def body():
+            path = os.path.join(B.WORK, f"{kind}.svg")
+            target = os.path.join(B.WORK, f"{kind}-target.txt")
+            if kind == "dir":
+                os.mkdir(path)
+            else:
+                with open(target, "wb") as stream:
+                    stream.write(HID_DOCTYPE)
+                os.symlink(target, path)
+            try:
+                label = B.entry("check_file")(path)
+            finally:
+                for leftover in (path + ".safety.json", target):
+                    if os.path.exists(leftover):
+                        os.unlink(leftover)
+                os.rmdir(path) if kind == "dir" else os.unlink(path)
+            reasons = label.get("static_reasons")
+            good = label.get("verdict") == "reject" and isinstance(reasons, list) and NAME not in reasons and reasons
+            return good, f"mime={label.get('mime')} verdict={label.get('verdict')} reasons={B.tail(reasons)}"
+        return body
+    B.attempt("ИМЯ: каталог с именем dir.svg — тип не определён, правило имени молчит",
+              "verdict=reject, причины имени нет", untyped("dir"))
+    B.attempt("ИМЯ: символическая ссылка link.svg на спрятанный корень — отказ прежней причиной, правило имени молчит",
+              "verdict=reject, причины имени нет", untyped("link"))
+
+    def toctou():
+        path = os.path.join(B.WORK, "gone.svg")
+        with open(path, "wb") as stream:
+            stream.write(B.SVGZ)
+        try:
+            # The path stops answering only at the final look: the label must then say so AFTER the name reason.
+            with mock.patch.object(os, "lstat", side_effect=OSError("injected by the test")):
+                label = B.entry("check_file")(path)
+        finally:
+            for leftover in (path, path + ".safety.json"):
+                if os.path.exists(leftover):
+                    os.unlink(leftover)
+        reasons = label.get("static_reasons")
+        good = reasons == [GZIP_REASON, NAME, "toctou_path_changed"] and label.get("verdict") == "reject"
+        return good, f"verdict={label.get('verdict')} reasons={B.tail(reasons)}"
+    B.attempt("ИМЯ, ПОРЯДОК: путь исчез к последнему взгляду — причина типа, причина имени, затем toctou_path_changed",
+              f"reasons={[GZIP_REASON, NAME, 'toctou_path_changed']}", toctou)
 
 
 # ================================================================ worker from the command line (§4.4)
