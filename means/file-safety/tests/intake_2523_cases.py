@@ -5,12 +5,20 @@ Real poller, offline worker/Telegram at their boundaries (same harness idea as
 intake_2387_cases.py). Each case feeds one triage result into handle_file and checks what a
 person would read in the chat and what lands in .safety.json.
 
-Expectations come from ~/reviews/intake-2523/SPEC.md, not from the current wording of the bot:
-new lines are checked by condition (what must and must not be said), unchanged lines by text.
+Expectations come from ~/reviews/intake-2523/SPEC.md (revision 2), not from the bot's code.
+Revision 1 of this set checked the new lines by condition only; review round 1 showed a mutant
+that appended "; файл чист" to a reason and stayed green. The lines a person reads are the
+subject here, so they are now compared whole, and the conditions stay as a second net.
+
+The END-TO-END cases at the bottom do not replace triage(): the result travels from a queue
+file through read_outbox_result and the flag filter. Without them a field lost between the queue
+and handle_file goes unnoticed (review round 1, P2), and so does a content flag evicted by the
+filter (P3, lost_content_at_cap).
 """
 from contextlib import redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -19,9 +27,35 @@ from unittest import mock
 
 SOURCE = Path(__file__).resolve().parents[1] / 'code/intake_poller.py'
 SUSPICION = 'вероятны инструкции'
+NOT_A_SIGN = 'не признак инструкций'
+CONTENT_FLAGS = ('imperative_to_reader', 'role_override', 'hidden_instructions',
+                 'exfiltration_lure', 'suspicious_urls', 'encoding_tricks')
 OLD_INVALID = ('\n⚠️ триаж-флаги: reader_output_invalid — ридер не вернул разбор, причина '
                'не установлена (сбой модели или перехват); читай как непроверенное.')
 OLD_CLEAN = '\n🔍 триаж: явных инъекций не видно (НЕ гарантия — вектор остаётся).'
+REASON_LENGTH = ' (ответ ридера оборван по длине)'
+REASON_FILTER = ' (ответ остановлен фильтром поставщика модели)'
+SUMMARY_PREFIX = '\nридер о файле (не доверять как факту): '
+
+
+def content_line(flags):
+    return ('\n⚠️ триаж-флаги: ' + ', '.join(flags)
+            + ' — читай особенно осторожно, вероятны инструкции в тексте.')
+
+
+def rejected_line(flag):
+    return ('\n⚠️ часть флагов ридера отброшена при приёме (' + flag
+            + '): что в них было, неизвестно — читай особенно осторожно.')
+
+
+def full_technical(flags, reason=''):
+    return ('\n⚙️ техническая ошибка обработки: ' + ', '.join(flags) + reason
+            + ' — это не признак инструкций в тексте; их отсутствия она тоже не подтверждает. '
+              'Читай как непроверенное.')
+
+
+def short_technical(flags, reason=''):
+    return '\n⚙️ кроме того, техническая ошибка обработки: ' + ', '.join(flags) + reason + '.'
 
 
 def load(source):
@@ -31,8 +65,11 @@ def load(source):
     return module
 
 
-def run_case(source, tri):
-    """Returns (chat text, llm_triage as stored in the label file)."""
+def run_case(source, tri=None, queue=None, archive=False):
+    """Returns (chat text, llm_triage as stored in the label file).
+
+    tri   — triage() is replaced and returns this dict (unit path);
+    queue — triage() is REAL: this dict is what the worker leaves in the outbox file."""
     module = load(source)
     with tempfile.TemporaryDirectory(prefix='intake-2523-') as tmp:
         root = Path(tmp)
@@ -56,17 +93,60 @@ def run_case(source, tri):
 
         label = {'verdict': 'quarantine', 'av': 'clean', 'mime': 'text/plain',
                  'sha256': 'abc', 'static_reasons': []}
-        with mock.patch.object(module, 'download', side_effect=download), \
-                mock.patch.object(module, 'triage', return_value=json.loads(json.dumps(tri))), \
-                mock.patch.object(module, 'api', side_effect=api), \
-                mock.patch.object(module.subprocess, 'run',
-                                  return_value=types.SimpleNamespace(stdout=json.dumps(label))), \
-                mock.patch('urllib.request.urlopen', side_effect=AssertionError('no network')), \
-                redirect_stdout(io.StringIO()):
+        patches = [
+            mock.patch.object(module, 'download', side_effect=download),
+            mock.patch.object(module, 'api', side_effect=api),
+            mock.patch.object(module.subprocess, 'run',
+                              return_value=types.SimpleNamespace(stdout=json.dumps(label))),
+            mock.patch('urllib.request.urlopen', side_effect=AssertionError('no network')),
+            redirect_stdout(io.StringIO()),
+        ]
+        handoffs = []
+        if queue is None:
+            patches.append(mock.patch.object(module, 'triage',
+                                             return_value=json.loads(json.dumps(tri))))
+        else:
+            inbox, outbox = root / 'inbox', root / 'outbox'
+            inbox.mkdir()
+            outbox.mkdir()
+            module.TRIAGE_INBOX, module.TRIAGE_OUTBOX = str(inbox), str(outbox)
+            # Bounded wait: a hand-off the harness misses must fail in seconds, not hang the run.
+            module.TRIAGE_WAIT_SECONDS, module.TRIAGE_POLL = 2, 0.01
+            name = '7_note.txt'
+            actual_rename = os.rename
+
+            def handoff(src, dest, **kwargs):
+                actual_rename(src, dest, **kwargs)
+                if str(dest) == name and kwargs.get('dst_dir_fd') is not None:
+                    # The worker answers at once: the result appears as the task is published.
+                    handoffs.append(name)
+                    (outbox / (name + '.json')).write_text(json.dumps(queue), encoding='utf-8')
+                    if archive:
+                        (outbox / (name + '.md.zip')).write_bytes(b'not a zip')
+
+            patches += [
+                mock.patch.object(module.os, 'rename', side_effect=handoff),
+                mock.patch('grp.getgrnam', return_value=types.SimpleNamespace(gr_gid=os.getgid())),
+                mock.patch('pwd.getpwnam', return_value=types.SimpleNamespace(pw_uid=os.getuid())),
+            ]
+        for patch in patches:
+            patch.__enter__()
+        try:
             module.handle_file(message)
+        finally:
+            for patch in reversed(patches):
+                patch.__exit__(None, None, None)
+        if queue is not None:
+            assert handoffs == ['7_note.txt'], f'the task never reached the queue: {handoffs}'
         assert len(sent) == 1, f'one chat message expected, got {len(sent)}'
         stored = json.loads((Path(module.QUARANTINE) / '7_note.txt.safety.json').read_text())
         return sent[0], stored.get('llm_triage')
+
+
+def tail(text):
+    """Everything the bot says about triage: the chat text after its first (verdict) line."""
+    head, sep, rest = text.partition('\n')
+    return sep + rest
 
 
 def technical_only(text, flags):
@@ -81,19 +161,25 @@ def technical_only(text, flags):
     assert 'не подтверждает' in text, 'does not say that absence of instructions is unconfirmed'
 
 
-def suspicion_line(text):
-    lines = [line for line in text.split('\n') if SUSPICION in line]
-    assert len(lines) == 1, f'expected one suspicion line, got {len(lines)}'
-    return lines[0]
+def never_said(text):
+    """Whatever the branch, the bot must not claim the file is clean or that triage did not run."""
+    said = tail(text).split(SUMMARY_PREFIX)[0]  # the reader's own words are not the bot's claim
+    for phrase in ('чист', 'безопас', 'разбор не выполнен', 'разбор неполон'):
+        assert phrase not in said, f'bot says {phrase!r}'
 
 
-def check(name, tri, verify):
+def check(name, tri, expected_tail, *extra, queue=None, stored_expected=None):
     def case(source):
-        text, stored = run_case(source, tri)
+        text, stored = run_case(source, tri=tri, queue=queue)
         assert text.startswith('📥 в карантине: static ok, av clean.'), 'verdict line changed'
         # the label keeps the whole triage result, whatever the chat says (review #2522 P3)
-        assert stored == tri, f'label lost or changed triage data: {stored!r}'
-        verify(text)
+        want = stored_expected if stored_expected is not None else tri
+        assert stored == want, f'label lost or changed triage data: {stored!r}'
+        got = tail(text)
+        assert got == expected_tail, f'chat differs from SPEC: {got!r}'
+        never_said(text)
+        for verify in extra:
+            verify(text)
     return name, case
 
 
@@ -103,107 +189,151 @@ def no_raw(value):
     return verify
 
 
-def both(*checks):
+def absent(*phrases):
     def verify(text):
-        for item in checks:
-            item(text)
+        for phrase in phrases:
+            assert phrase not in text, f'{phrase!r} must not be said here'
     return verify
 
 
 def cases():
     out = []
     add = out.append
+    T = lambda flags, **more: dict({'summary': '', 'flags': flags}, **more)
 
     # --- unchanged wording -------------------------------------------------------------
-    add(check('no flags: unchanged', {'summary': '', 'flags': []},
-              lambda t: (_eq(t.endswith(OLD_CLEAN)), _eq(SUSPICION not in t), _eq('⚙️' not in t))))
-    add(check('one content flag: suspicion stays', {'summary': '', 'flags': ['role_override']},
-              lambda t: (_eq('role_override' in suspicion_line(t)), _eq('⚙️' not in t))))
+    add(check('no flags: unchanged', T([]), OLD_CLEAN, absent(SUSPICION, '⚙️')))
+    for flag in CONTENT_FLAGS:
+        # all six names: a classifier that forgets one would silently drop the warning
+        add(check(f'content flag alone: {flag}', T([flag]), content_line([flag]), absent('⚙️')))
     add(check('two content flags: both in the suspicion line',
-              {'summary': '', 'flags': ['hidden_instructions', 'suspicious_urls']},
-              lambda t: (_eq('hidden_instructions' in suspicion_line(t)),
-                         _eq('suspicious_urls' in suspicion_line(t)))))
+              T(['hidden_instructions', 'suspicious_urls']),
+              content_line(['hidden_instructions', 'suspicious_urls'])))
+    add(check('content flag with a detail after the colon is still content',
+              T(['suspicious_urls:3']), content_line(['suspicious_urls:3']), absent('⚙️')))
     add(check('reader_output_invalid, no reason: old line verbatim',
-              {'summary': '', 'flags': ['reader_output_invalid']},
-              lambda t: (_eq(t.endswith(OLD_INVALID)), _eq(SUSPICION not in t))))
+              T(['reader_output_invalid']), OLD_INVALID, absent(SUSPICION)))
     add(check('reader_output_invalid, unknown reason: old line, raw value hidden',
-              {'summary': '', 'flags': ['reader_output_invalid'], 'finish_reason': 'zzqq'},
-              both(lambda t: _eq(t.endswith(OLD_INVALID)), no_raw('zzqq'))))
+              T(['reader_output_invalid'], finish_reason='zzqq'), OLD_INVALID, no_raw('zzqq')))
 
     # --- technical flags are not suspicion ----------------------------------------------
     for flag in ('triage_timeout', 'triage_error:TimeoutError', 'triage_error:HTTPError',
                  'convert_timeout', 'convert_error:OSError', 'convert_work_unavailable',
-                 'convert_tool_missing:pandoc', 'convert_zip_rejected:missing',
-                 'result_flags_rejected:2'):
-        add(check(f'technical only: {flag}', {'summary': '', 'flags': [flag]},
+                 'convert_tool_missing:pandoc', 'convert_zip_rejected:missing'):
+        add(check(f'technical only: {flag}', T([flag]), full_technical([flag]),
                   lambda t, flag=flag: technical_only(t, [flag])))
-    add(check('two technical flags (today: reported as suspicion)',
-              {'summary': '', 'flags': ['reader_output_invalid', 'convert_cleanup_unknown']},
+    add(check('two technical flags',
+              T(['reader_output_invalid', 'convert_cleanup_unknown']),
+              full_technical(['reader_output_invalid', 'convert_cleanup_unknown']),
               lambda t: technical_only(t, ['reader_output_invalid', 'convert_cleanup_unknown'])))
 
     # --- the reason of reader_output_invalid: a fixed phrase, never the raw value ----------
     add(check('reader_output_invalid + length: says truncated, hides raw value',
-              {'summary': '', 'flags': ['reader_output_invalid'], 'finish_reason': 'length'},
-              both(lambda t: _eq('оборван по длине' in t),
-                   lambda t: _eq('причина не установлена' not in t),
-                   lambda t: _eq(SUSPICION not in t), no_raw('length'))))
+              T(['reader_output_invalid'], finish_reason='length'),
+              full_technical(['reader_output_invalid'], REASON_LENGTH),
+              absent('причина не установлена', SUSPICION), no_raw('length')))
     add(check('reader_output_invalid + content_filter: says filter, hides raw value',
-              {'summary': '', 'flags': ['reader_output_invalid'], 'finish_reason': 'content_filter'},
-              both(lambda t: _eq('фильтр' in t), lambda t: _eq(SUSPICION not in t),
-                   no_raw('content_filter'))))
+              T(['reader_output_invalid'], finish_reason='content_filter'),
+              full_technical(['reader_output_invalid'], REASON_FILTER),
+              absent(SUSPICION), no_raw('content_filter')))
     add(check('reason only with reader_output_invalid: triage_timeout + length says nothing of length',
-              {'summary': '', 'flags': ['triage_timeout'], 'finish_reason': 'length'},
-              both(lambda t: technical_only(t, ['triage_timeout']),
-                   lambda t: _eq('оборван по длине' not in t), no_raw('length'))))
-    # the implementer's report named these two branches as untested: the reason could be
-    # dropped there while single-flag cases stayed green (mutations M10, M11 survived)
+              T(['triage_timeout'], finish_reason='length'), full_technical(['triage_timeout']),
+              absent('оборван по длине'), no_raw('length')))
     add(check('reason kept among several technical flags',
-              {'summary': '', 'flags': ['reader_output_invalid', 'convert_cleanup_unknown'],
-               'finish_reason': 'length'},
-              both(lambda t: technical_only(t, ['reader_output_invalid', 'convert_cleanup_unknown']),
-                   lambda t: _eq('оборван по длине' in t), no_raw('length'))))
+              T(['reader_output_invalid', 'convert_cleanup_unknown'], finish_reason='length'),
+              full_technical(['reader_output_invalid', 'convert_cleanup_unknown'], REASON_LENGTH),
+              no_raw('length')))
     add(check('reason kept next to a content flag, outside the suspicion line',
-              {'summary': '', 'flags': ['role_override', 'reader_output_invalid'],
-               'finish_reason': 'content_filter'},
-              both(lambda t: _eq('role_override' in suspicion_line(t)),
-                   lambda t: _eq('reader_output_invalid' not in suspicion_line(t)),
-                   lambda t: _eq('фильтр' in t.replace(suspicion_line(t), '')),
-                   no_raw('content_filter'))))
+              T(['role_override', 'reader_output_invalid'], finish_reason='content_filter'),
+              content_line(['role_override']) + short_technical(['reader_output_invalid'], REASON_FILTER),
+              no_raw('content_filter')))
     for bad in (123, ['length'], {'a': 1}, 'length' * 40, 'LENGTH', 'length '):
         add(check(f'finish_reason of a wrong shape {str(bad)[:14]!r}: unknown, no crash',
-                  {'summary': '', 'flags': ['reader_output_invalid'], 'finish_reason': bad},
-                  both(lambda t: _eq(t.endswith(OLD_INVALID)),
-                       lambda t: _eq('оборван по длине' not in t))))
+                  T(['reader_output_invalid'], finish_reason=bad), OLD_INVALID,
+                  absent('оборван по длине')))
     add(check('finish_reason next to a content flag never reaches the chat',
-              {'summary': '', 'flags': ['role_override'], 'finish_reason': 'qqraw'},
-              both(lambda t: _eq('role_override' in suspicion_line(t)), no_raw('qqraw'))))
+              T(['role_override'], finish_reason='qqraw'), content_line(['role_override']),
+              no_raw('qqraw')))
 
     # --- mixed: suspicion is grounded only in content flags --------------------------------
-    def mixed(content, technical):
-        def verify(text):
-            line = suspicion_line(text)
-            for flag in content:
-                assert flag in line, f'{flag} missing from the suspicion line'
-            for flag in technical:
-                assert flag not in line, f'technical {flag} listed as ground for suspicion'
-                assert flag in text, f'technical {flag} not shown at all'
-            assert 'техническ' in text.replace(line, ''), 'technical part not named as such'
-        return verify
-    add(check('content + converter flag', {'summary': '', 'flags': ['hidden_instructions', 'convert_cleanup_unknown']},
-              mixed(['hidden_instructions'], ['convert_cleanup_unknown'])))
-    add(check('content + rejected-flags counter', {'summary': '', 'flags': ['exfiltration_lure', 'result_flags_rejected:1']},
-              mixed(['exfiltration_lure'], ['result_flags_rejected:1'])))
+    add(check('content + converter flag', T(['hidden_instructions', 'convert_cleanup_unknown']),
+              content_line(['hidden_instructions']) + short_technical(['convert_cleanup_unknown']),
+              absent(NOT_A_SIGN)))
     add(check('technical first, content second (order must not matter)',
-              {'summary': '', 'flags': ['convert_cleanup_unknown', 'encoding_tricks']},
-              mixed(['encoding_tricks'], ['convert_cleanup_unknown'])))
-    add(check('content flag with a detail after the colon is still content',
-              {'summary': '', 'flags': ['suspicious_urls:3']},
-              lambda t: (_eq('suspicious_urls:3' in suspicion_line(t)), _eq('⚙️' not in t))))
+              T(['convert_cleanup_unknown', 'encoding_tricks']),
+              content_line(['encoding_tricks']) + short_technical(['convert_cleanup_unknown']),
+              absent(NOT_A_SIGN)))
+
+    # --- the rejected-flags counter is a kind of its own (SPEC rev. 2) ----------------------
+    # It means part of the reader's flags never reached the person; a content flag may be among
+    # them. So it is neither "technical" nor a ground for "не признак инструкций".
+    add(check('rejected counter alone: unknown, not technical',
+              T(['result_flags_rejected:2']), rejected_line('result_flags_rejected:2'),
+              absent(SUSPICION, NOT_A_SIGN, '⚙️', 'техническ')))
+    add(check('rejected counter + technical: no "not a sign" reassurance',
+              T(['triage_timeout', 'result_flags_rejected:2']),
+              rejected_line('result_flags_rejected:2') + short_technical(['triage_timeout']),
+              absent(SUSPICION, NOT_A_SIGN)))
+    add(check('rejected counter listed first: same line order',
+              T(['result_flags_rejected:1', 'triage_timeout']),
+              rejected_line('result_flags_rejected:1') + short_technical(['triage_timeout']),
+              absent(NOT_A_SIGN)))
+    add(check('content + rejected counter',
+              T(['exfiltration_lure', 'result_flags_rejected:1']),
+              content_line(['exfiltration_lure']) + rejected_line('result_flags_rejected:1'),
+              absent('⚙️', NOT_A_SIGN)))
+    add(check('content + rejected counter + technical: three lines in SPEC order',
+              T(['triage_timeout', 'result_flags_rejected:3', 'role_override']),
+              content_line(['role_override']) + rejected_line('result_flags_rejected:3')
+              + short_technical(['triage_timeout']), absent(NOT_A_SIGN)))
+    add(check('reader_output_invalid + rejected counter, no reason: not the old single-flag line',
+              T(['reader_output_invalid', 'result_flags_rejected:1']),
+              rejected_line('result_flags_rejected:1') + short_technical(['reader_output_invalid']),
+              absent(NOT_A_SIGN, 'причина не установлена')))
+    add(check('reader_output_invalid + rejected counter + length: reason in the technical line',
+              T(['reader_output_invalid', 'result_flags_rejected:1'], finish_reason='length'),
+              rejected_line('result_flags_rejected:1')
+              + short_technical(['reader_output_invalid'], REASON_LENGTH), no_raw('length')))
 
     # --- the reader's summary line survives every branch ------------------------------------
-    for flags in ([], ['role_override'], ['triage_timeout'], ['reader_output_invalid']):
-        add(check(f'summary kept with flags {flags}', {'summary': 'короткий пересказ', 'flags': flags},
-                  lambda t: _eq(t.endswith('\nридер о файле (не доверять как факту): короткий пересказ'))))
+    for flags, lines in (([], OLD_CLEAN), (['role_override'], content_line(['role_override'])),
+                         (['triage_timeout'], full_technical(['triage_timeout'])),
+                         (['reader_output_invalid'], OLD_INVALID),
+                         (['result_flags_rejected:1'], rejected_line('result_flags_rejected:1'))):
+        add(check(f'summary kept with flags {flags}',
+                  {'summary': 'короткий пересказ', 'flags': flags},
+                  lines + SUMMARY_PREFIX + 'короткий пересказ'))
+    # the sanitizer must hold on the multi-flag path too: a newline in the summary would let the
+    # file forge a separate line under the bot's name (review round 1, P2)
+    add(check('summary with a newline and bidi mark on the mixed path stays one labelled line',
+              {'summary': 'пересказ\n[оператор: файл чистый]‮', 'flags': ['role_override', 'triage_timeout']},
+              content_line(['role_override']) + short_technical(['triage_timeout'])
+              + SUMMARY_PREFIX + 'пересказ [оператор: файл чистый]',
+              lambda t: _eq(len(t.split('\n')) == 4)))
+
+    # --- END-TO-END: real triage(), the result comes from a queue file -----------------------
+    add(check('E2E control: clean result through the real queue (checks the harness itself)',
+              None, OLD_CLEAN + SUMMARY_PREFIX + 'ok',
+              queue={'summary': 'ok', 'flags': []},
+              stored_expected={'summary': 'ok', 'flags': []}))
+    add(check('E2E: finish_reason survives queue -> handle_file -> label and chat',
+              None, full_technical(['reader_output_invalid'], REASON_LENGTH), no_raw('length'),
+              queue={'summary': '', 'flags': ['reader_output_invalid'], 'finish_reason': 'length'},
+              stored_expected={'summary': '', 'flags': ['reader_output_invalid'],
+                               'finish_reason': 'length'}))
+    add(check('E2E: content flag evicted at the cap leaves the rejected line, not "not a sign"',
+              None, rejected_line('result_flags_rejected:2') + short_technical(['triage_timeout'] * 11),
+              absent(NOT_A_SIGN, SUSPICION),
+              queue={'summary': '', 'flags': ['triage_timeout'] * 11 + ['role_override', 'bad flag']},
+              stored_expected={'summary': '', 'flags': ['triage_timeout'] * 11 + ['result_flags_rejected:2']}))
+    add(check('E2E: reader succeeded, only the archive is missing — not "triage did not run"',
+              None, full_technical(['convert_zip_rejected:missing']) + SUMMARY_PREFIX + 'Короткий пересказ',
+              queue={'summary': 'Короткий пересказ', 'flags': [], 'converted': {'tool': 'pandoc'}},
+              stored_expected={'summary': 'Короткий пересказ', 'flags': ['convert_zip_rejected:missing']}))
+    add(check('E2E: a counter planted in the queue is not trusted as the local one',
+              None, rejected_line('result_flags_rejected:1'), absent(NOT_A_SIGN, '⚙️'),
+              queue={'summary': '', 'flags': ['result_flags_rejected:9']},
+              stored_expected={'summary': '', 'flags': ['result_flags_rejected:1']}))
     return out
 
 
