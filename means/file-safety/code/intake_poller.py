@@ -534,14 +534,36 @@ def handle_file(msg):
             # text — treat it as untrusted (same sanitizer as reject reasons),
             # and label it as the reader's claim, not the bot's statement.
             summary = sanitize_for_chat(tri.get("summary") or "")
-            if flags == ["reader_output_invalid"]:
-                # ЗАЧЕМ отдельно: флаг значит лишь «ответ ридера не разобрался» — сбой модели на
-                # большом файле, обрезка или перехват; причину никто не проверял (Claudette, Грибница 8990).
+            # Technical failures must not become evidence of instructions in the file.
+            content_flags = [f for f in flags if f.split(":", 1)[0] in RESULT_KNOWN_FLAGS]
+            technical_flags = [f for f in flags if f.split(":", 1)[0] not in RESULT_KNOWN_FLAGS]
+            reason = ""
+            if "reader_output_invalid" in flags:
+                # Queue data is untrusted; only fixed explanations may reach the chat.
+                finish_reason = tri.get("finish_reason")
+                if isinstance(finish_reason, str):
+                    if finish_reason == "length":
+                        reason = " (ответ ридера оборван по длине)"
+                    elif finish_reason == "content_filter":
+                        reason = " (ответ остановлен фильтром поставщика модели)"
+            if flags == ["reader_output_invalid"] and not reason:
+                # Kept verbatim: alone, this flag only says the reader's answer did not parse —
+                # a model failure on a big file, truncation or hijack; nobody checked which
+                # (Claudette, Грибница 8990).
                 tri_line = ("\n⚠️ триаж-флаги: reader_output_invalid — ридер не вернул разбор, причина "
                             "не установлена (сбой модели или перехват); читай как непроверенное.")
             elif flags:
-                tri_line = (f"\n⚠️ триаж-флаги: {', '.join(flags)} — читай особенно "
-                            f"осторожно, вероятны инструкции в тексте.")
+                if content_flags:
+                    tri_line = (f"\n⚠️ триаж-флаги: {', '.join(content_flags)} — читай особенно "
+                                "осторожно, вероятны инструкции в тексте.")
+                if technical_flags:
+                    if content_flags:
+                        tri_line += (f"\n⚙️ кроме того, разбор неполон: {', '.join(technical_flags)}"
+                                     f"{reason} — техническая ошибка.")
+                    else:
+                        tri_line = (f"\n⚙️ разбор не выполнен: {', '.join(technical_flags)}{reason} — "
+                                    "это техническая ошибка, не признак инструкций в тексте; "
+                                    "их отсутствия она тоже не подтверждает. Читай как непроверенное.")
             else:
                 tri_line = "\n🔍 триаж: явных инъекций не видно (НЕ гарантия — вектор остаётся)."
             if summary:
