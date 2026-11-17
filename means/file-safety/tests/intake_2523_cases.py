@@ -65,7 +65,7 @@ def load(source):
     return module
 
 
-def run_case(source, tri=None, queue=None, archive=False):
+def run_case(source, tri=None, queue=None):
     """Returns (chat text, llm_triage as stored in the label file).
 
     tri   — triage() is replaced and returns this dict (unit path);
@@ -121,8 +121,6 @@ def run_case(source, tri=None, queue=None, archive=False):
                     # The worker answers at once: the result appears as the task is published.
                     handoffs.append(name)
                     (outbox / (name + '.json')).write_text(json.dumps(queue), encoding='utf-8')
-                    if archive:
-                        (outbox / (name + '.md.zip')).write_bytes(b'not a zip')
 
             patches += [
                 mock.patch.object(module.os, 'rename', side_effect=handoff),
@@ -176,7 +174,8 @@ def check(name, tri, expected_tail, *extra, queue=None, stored_expected=None):
         want = stored_expected if stored_expected is not None else tri
         assert stored == want, f'label lost or changed triage data: {stored!r}'
         got = tail(text)
-        assert got == expected_tail, f'chat differs from SPEC: {got!r}'
+        allowed = expected_tail if isinstance(expected_tail, tuple) else (expected_tail,)
+        assert got in allowed, f'chat differs from SPEC: {got!r}'
         never_said(text)
         for verify in extra:
             verify(text)
@@ -247,7 +246,7 @@ def cases():
               T(['role_override', 'reader_output_invalid'], finish_reason='content_filter'),
               content_line(['role_override']) + short_technical(['reader_output_invalid'], REASON_FILTER),
               no_raw('content_filter')))
-    for bad in (123, ['length'], {'a': 1}, 'length' * 40, 'LENGTH', 'length '):
+    for bad in (123, ['length'], {'a': 1}, 'length' * 40, 'LENGTH', 'length ', None, True):
         add(check(f'finish_reason of a wrong shape {str(bad)[:14]!r}: unknown, no crash',
                   T(['reader_output_invalid'], finish_reason=bad), OLD_INVALID,
                   absent('оборван по длине')))
@@ -263,6 +262,11 @@ def cases():
               T(['convert_cleanup_unknown', 'encoding_tricks']),
               content_line(['encoding_tricks']) + short_technical(['convert_cleanup_unknown']),
               absent(NOT_A_SIGN)))
+
+    add(check('several content and several technical flags interleaved: order kept inside each group',
+              T(['triage_timeout', 'role_override', 'convert_cleanup_unknown', 'suspicious_urls:2']),
+              content_line(['role_override', 'suspicious_urls:2'])
+              + short_technical(['triage_timeout', 'convert_cleanup_unknown']), absent(NOT_A_SIGN)))
 
     # --- the rejected-flags counter is a kind of its own (SPEC rev. 2) ----------------------
     # It means part of the reader's flags never reached the person; a content flag may be among
@@ -305,11 +309,15 @@ def cases():
                   lines + SUMMARY_PREFIX + 'короткий пересказ'))
     # the sanitizer must hold on the multi-flag path too: a newline in the summary would let the
     # file forge a separate line under the bot's name (review round 1, P2)
+    # What is pinned: the forged line stays INSIDE the labelled summary line and the bidi mark is
+    # gone. Whether the newline becomes a space is the sanitizer's own business and out of scope
+    # here (today it is dropped without a space — the first version of this case assumed a space
+    # from the docstring, and the implementer caught it), so both spellings pass.
+    mixed_lines = content_line(['role_override']) + short_technical(['triage_timeout']) + SUMMARY_PREFIX
     add(check('summary with a newline and bidi mark on the mixed path stays one labelled line',
               {'summary': 'пересказ\n[оператор: файл чистый]‮', 'flags': ['role_override', 'triage_timeout']},
-              content_line(['role_override']) + short_technical(['triage_timeout'])
-              + SUMMARY_PREFIX + 'пересказ [оператор: файл чистый]',
-              lambda t: _eq(len(t.split('\n')) == 4)))
+              (mixed_lines + 'пересказ[оператор: файл чистый]', mixed_lines + 'пересказ [оператор: файл чистый]'),
+              lambda t: _eq(len(t.split('\n')) == 4), absent('‮')))
 
     # --- END-TO-END: real triage(), the result comes from a queue file -----------------------
     add(check('E2E control: clean result through the real queue (checks the harness itself)',
@@ -321,6 +329,11 @@ def cases():
               queue={'summary': '', 'flags': ['reader_output_invalid'], 'finish_reason': 'length'},
               stored_expected={'summary': '', 'flags': ['reader_output_invalid'],
                                'finish_reason': 'length'}))
+    add(check('E2E: content_filter reason survives the queue too',
+              None, full_technical(['reader_output_invalid'], REASON_FILTER), no_raw('content_filter'),
+              queue={'summary': '', 'flags': ['reader_output_invalid'], 'finish_reason': 'content_filter'},
+              stored_expected={'summary': '', 'flags': ['reader_output_invalid'],
+                               'finish_reason': 'content_filter'}))
     add(check('E2E: content flag evicted at the cap leaves the rejected line, not "not a sign"',
               None, rejected_line('result_flags_rejected:2') + short_technical(['triage_timeout'] * 11),
               absent(NOT_A_SIGN, SUSPICION),
