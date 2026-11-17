@@ -16,6 +16,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -26,9 +27,9 @@ SVG_MIME = "image/svg+xml"
 SVG_BYTES = b'<svg xmlns="http://www.w3.org/2000/svg"><text>x</text></svg>\n'
 
 
-def load():
+def load(source=None):
     # The poller reads its production token at import; only that read is replaced.
-    spec = importlib.util.spec_from_file_location("intake_svg_under_test", SOURCE)
+    spec = importlib.util.spec_from_file_location("intake_svg_under_test", source or SOURCE)
     module = importlib.util.module_from_spec(spec)
     with mock.patch("builtins.open", return_value=io.StringIO("test-token")):
         spec.loader.exec_module(module)
@@ -91,41 +92,72 @@ OLD_KINDS = ["text/*", "image/png", "image/jpeg", "image/gif", "image/webp", "ap
              "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]
 
 
+def reject_texts(module, root, message_id=7):
+    """One reject by type through handle_file; the hint itself is not replaced. Returns what the bot sent."""
+    for attr in ("INCOMING", "QUARANTINE"):
+        (root / attr).mkdir(exist_ok=True)
+        setattr(module, attr, str(root / attr))
+    module.OFFSET_FILE = str(root / "offset")
+    module.GROUP_ID = -100123
+    message = {"chat": {"id": module.GROUP_ID}, "message_id": message_id, "message_thread_id": 91,
+               "document": {"file_id": "file-id", "file_name": "x.bin", "file_size": 4}}
+    label = {"verdict": "reject", "av": "clean", "mime": "application/x-test", "sha256": "abc",
+             "static_reasons": ["mime_not_whitelisted:application/x-test"]}
+    texts = []
+
+    def api(method, **params):
+        if method == "sendMessage":
+            texts.append(params.get("text", ""))
+        return {"ok": True}
+
+    with mock.patch.object(module, "download", side_effect=lambda file_id, path: Path(path).write_bytes(b"data")), \
+            mock.patch.object(module, "triage", return_value={"status": "SKIPPED:test"}), \
+            mock.patch.object(module, "api", side_effect=api), \
+            mock.patch.object(module.subprocess, "run", return_value=SimpleNamespace(stdout=json.dumps(label))), \
+            mock.patch("urllib.request.urlopen", side_effect=AssertionError("network")), \
+            redirect_stdout(io.StringIO()):
+        module.handle_file(message)
+    return texts
+
+
 def hint_case(full=False):
-    """Reject by type through handle_file; the hint itself is not replaced.
-    full=True: the hint still names every type the gate accepted before SVG was added."""
-    module = load()
+    """full=True: the hint still names every type the gate accepted before SVG was added."""
     with tempfile.TemporaryDirectory(prefix="intake-2411-hint-") as tmp:
-        root = Path(tmp)
-        for attr in ("INCOMING", "QUARANTINE"):
-            (root / attr).mkdir()
-            setattr(module, attr, str(root / attr))
-        module.OFFSET_FILE = str(root / "offset")
-        module.GROUP_ID = -100123
-        message = {"chat": {"id": module.GROUP_ID}, "message_id": 7, "message_thread_id": 91,
-                   "document": {"file_id": "file-id", "file_name": "x.bin", "file_size": 4}}
-        label = {"verdict": "reject", "av": "clean", "mime": "application/x-test", "sha256": "abc",
-                 "static_reasons": ["mime_not_whitelisted:application/x-test"]}
-        texts = []
-
-        def api(method, **params):
-            if method == "sendMessage":
-                texts.append(params.get("text", ""))
-            return {"ok": True}
-
-        with mock.patch.object(module, "download", side_effect=lambda file_id, path: Path(path).write_bytes(b"data")), \
-                mock.patch.object(module, "triage", return_value={"status": "SKIPPED:test"}), \
-                mock.patch.object(module, "api", side_effect=api), \
-                mock.patch.object(module.subprocess, "run", return_value=SimpleNamespace(stdout=json.dumps(label))), \
-                mock.patch("urllib.request.urlopen", side_effect=AssertionError("network")), \
-                redirect_stdout(io.StringIO()):
-            module.handle_file(message)
+        texts = reject_texts(load(), Path(tmp))
     hinted = [t for t in texts if "Принимаются" in t]
     wanted = OLD_KINDS if full else [SVG_MIME]
     missing = [kind for kind in wanted if not all(kind in t for t in hinted)]
     good = bool(hinted) and not missing
     return good, (f"сообщений={len(texts)} с «Принимаются»={len(hinted)} не названы={missing} "
                   f"текст={(hinted or texts or [''])[0][:400]!r}")
+
+
+RENAMED = "image/x-renamed-by-the-test-2411"
+
+
+def hint_rereads_case():
+    """SPEC ed. 3 §4.3: the hint is read from the gate file next to the poller on every reject.
+    ONE loaded poller rejects twice; between the rejects the gate copy beside it is edited. A hint
+    remembered from the first reject shows as the old type in the second message. The new literal
+    differs in length, so stale bytecode of the gate copy cannot stand in for the edited source."""
+    with tempfile.TemporaryDirectory(prefix="intake-2411-reread-") as tmp:
+        root = Path(tmp)
+        code = root / "code"
+        code.mkdir()
+        shutil.copyfile(SOURCE, code / "intake_poller.py")
+        gate = code / "file_safety_check.py"
+        shutil.copyfile(SOURCE.parent / "file_safety_check.py", gate)
+        module = load(code / "intake_poller.py")
+        first = [t for t in reject_texts(module, root, 7) if "Принимаются" in t]
+        text = gate.read_text(encoding="utf-8")
+        swapped = text.count('"' + SVG_MIME + '"')
+        gate.write_text(text.replace('"' + SVG_MIME + '"', '"' + RENAMED + '"'), encoding="utf-8")
+        second = [t for t in reject_texts(module, root, 8) if "Принимаются" in t]
+    first_ok = bool(first) and all(SVG_MIME in t for t in first)
+    good = (swapped >= 1 and first_ok and bool(second)
+            and all(RENAMED in t and SVG_MIME not in t for t in second))
+    return good, (f"замен в копии гейта={swapped}; первая подсказка называет {SVG_MIME}: {first_ok}; "
+                  f"вторая: {(second or [''])[0][:300]!r}")
 
 
 CASES = [
@@ -137,6 +169,10 @@ CASES = [
      "в сообщении с «Принимаются» есть image/svg+xml"),
     ("§4.3 р3: подсказка называет и все прежние типы белого списка", lambda: hint_case(full=True),
      "в сообщении с «Принимаются» названы все одиннадцать прежних типов"),
+    ("§4.3 р3: подсказка читается из файла проверки при КАЖДОМ отказе (кеша нет)", hint_rereads_case,
+     "после правки копии гейта вторая подсказка называет новый тип и не называет image/svg+xml"),
+    ("§4.4: application/json по-прежнему уходит на разбор как текст", lambda: triage_case("application/json"),
+     "одна передача без kind, summary=ok, не SKIPPED:non_textual, без converted и md.zip"),
 ] + [
     (f"§4.3 р3: {mime} по-прежнему не идёт на смысловой разбор", lambda mime=mime: triage_case(mime, skipped=True),
      "передач нет, результат {'status': 'SKIPPED:non_textual'}")

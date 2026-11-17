@@ -264,6 +264,35 @@ def robustness_group():
     B.attempt("§4.2 р3: подмена каждого класса модуля, ParserCreate и os.pread на бросающий MemoryError",
               f"где подмена была вызвана — (False, ['{B.PERR}']), где нет — (True, []); вызвано не меньше двух", body)
 
+    def late():
+        if B.FSC is None:
+            raise B.Missing(f"модуль не загружен ({B.LOAD_ERROR})")
+        check = B.entry("svg_check")
+        # A forbidden element sits in the first block; the read that fails is a later one. §4.2:
+        # reasons collected before the check stops are kept, the failure adds svg_parse_error.
+        data = B.svg_str("<unknown-element-2411/>" + " " * 200_000).encode("utf-8")
+        real, calls = os.pread, []
+
+        def late_pread(fd, size, pos):
+            if pos:
+                calls.append(pos)
+                raise OSError("injected by the test: late read")
+            return real(fd, size, pos)
+
+        def action(fd, path):
+            with mock.patch.object(os, "pread", late_pread):
+                try:
+                    ok, reasons = check(fd)
+                    return (ok, reasons)
+                except BaseException as exc:
+                    return f"ИСКЛЮЧЕНИЕ {type(exc).__name__}"
+        result, intact = B.on_file(data, ".svg", action)
+        want = (False, sorted([B.ELEM, B.PERR]))
+        good = intact and bool(calls) and not isinstance(result, str) and tuple(result) == want
+        return good, f"поздних чтений {len(calls)}: {result if isinstance(result, str) else tuple(result)}"
+    B.attempt("§4.2 р3: сбой чтения ПОСЛЕ первого блока — собранное до сбоя сохраняется",
+              f"(False, ['{B.ELEM}', '{B.PERR}']) и хотя бы одно позднее чтение", late)
+
 
 # ================================================================ check_file: the name rule (§4.1, §4.5, §4.6)
 SCRIPT_SVG = B.svg_str("<script>alert(1)</script>" + B.RECT)
