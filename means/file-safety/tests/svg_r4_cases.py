@@ -75,6 +75,19 @@ def zip_failure_group():
             (result if isinstance(result, str) else tuple(result))
     B.attempt("П1 р4 контроль: та же PNG-фикстура без подмены (подлинное «не ZIP»)", "(True, [])", clean)
 
+    # Review round 4, P2: the fix tells the check's own failure from an exception the caller was already
+    # handling. Called from inside an outer handler, a whole PNG must still pass and an injected failure
+    # must still refuse — without these two cases dropping that distinction left this set green.
+    for label, patch, want in (("без подмены", None, (True, [])), ("OSError", OSError, (False, [B.PERR]))):
+        def outer(patch=patch, want=want):
+            try:
+                raise LookupError("the caller's own exception, already being handled")
+            except LookupError:
+                result, intact, calls = run_check(PNG_DRAWING, patch=patch)
+            good = intact and not isinstance(result, str) and tuple(result) == want and bool(calls) == bool(patch)
+            return good, f"вызовов подмены {len(calls)}: {result if isinstance(result, str) else tuple(result)}"
+        B.attempt(f"П1 р4: вызов изнутри чужого обработчика исключения, {label}", str(want), outer)
+
     def real_zip():
         result, intact, _ = run_check(B.svg(B.image(B.png_uri(B.PNG_ZIP))))
         return intact and not isinstance(result, str) and tuple(result) == (False, [B.IMGD]), \
