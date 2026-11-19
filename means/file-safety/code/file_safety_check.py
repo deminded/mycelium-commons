@@ -735,10 +735,17 @@ def _svg_image_data_ok(image_type, payload):
         complete = data.startswith(b"\xff\xd8\xff") and data.endswith(JPEG_TAIL)
     if not complete:
         return False
+    active_exception = sys.exc_info()[1]
     try:
         with zipfile.ZipFile(io.BytesIO(data)):
             return False
-    except zipfile.BadZipFile:
+    except zipfile.BadZipFile as exc:
+        # ZipFile wraps a read failure in the same BadZipFile as a missing
+        # directory. An exception already handled by the caller is unrelated.
+        if exc.__cause__ is not None or (
+            exc.__context__ is not None and exc.__context__ is not active_exception
+        ):
+            raise
         return True
 
 
