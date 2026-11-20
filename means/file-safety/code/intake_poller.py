@@ -18,6 +18,7 @@ the next update is fetched (a quarantine circuit should not race itself).
 """
 import errno
 import grp
+import importlib.util
 import json
 import os
 import pwd
@@ -256,7 +257,7 @@ def triage(quarantined_path, mime):
     {summary, flags} (plus optional converted metadata) or a SKIPPED-shaped dict.
     Never raises or returns a verdict. Unsupported MIME types skip explicitly."""
     kind = TRIAGE_CONVERT_KINDS.get(mime)
-    if not kind and not any(mime.startswith(p) for p in TRIAGE_TEXTUAL_PREFIXES):
+    if not kind and mime != "image/svg+xml" and not mime.startswith(TRIAGE_TEXTUAL_PREFIXES):
         return {"status": "SKIPPED:non_textual"}
     name = os.path.basename(quarantined_path)
     outbox_path = os.path.join(TRIAGE_OUTBOX, name + ".json")
@@ -405,7 +406,11 @@ def accepted_formats_hint():
     # 03.11.2026). The list comes from the gate's own whitelist so the hint cannot drift
     # from the policy; on any import trouble the reject still goes out, just without it.
     try:
-        import file_safety_check as fsc
+        # The poller can be loaded by path without its directory on sys.path.
+        source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "file_safety_check.py")
+        spec = importlib.util.spec_from_file_location("file_safety_check", source)
+        fsc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fsc)
         kinds = [p + "*" if p.endswith("/") else p for p in fsc.MIME_WHITELIST_PREFIXES]
         kinds += sorted(fsc.MIME_WHITELIST_EXACT)
         return " Принимаются: " + ", ".join(kinds) + "."

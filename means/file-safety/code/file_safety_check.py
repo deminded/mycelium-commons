@@ -20,8 +20,12 @@ path still names that inode. A path swap mid-check can therefore neither
 redirect what gets scanned nor attach our verdict to a different file.
 """
 
+import base64
+import binascii
+import codecs
 import errno
 import hashlib
+import io
 import json
 import os
 import re
@@ -53,9 +57,11 @@ MIME_WHITELIST_PREFIXES = (
 # "zip inside a non-zip" polyglot rule does not), and every zip that turns out to be an
 # OOXML package must also pass ooxml_check().
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+SVG_MIME = "image/svg+xml"
 
 MIME_WHITELIST_EXACT = {
     DOCX_MIME,
+    SVG_MIME,
     "application/pdf",
     "application/json",
     "application/zip",
@@ -183,6 +189,35 @@ GIF_TAIL = b";"                                # 0x3B trailer
 # WebP has no terminator marker, but its RIFF header states the payload length:
 # 'RIFF' + uint32 LE size + 'WEBP'. Bytes past size + 8 are the same channel.
 WEBP_RIFF_HEADER_LEN = 12
+
+SVG_NS = "http://www.w3.org/2000/svg"
+XLINK_NS = "http://www.w3.org/1999/xlink"
+XML_NS = "http://www.w3.org/XML/1998/namespace"
+SVG_EDITOR_NAMESPACES = {
+    "http://www.inkscape.org/namespaces/inkscape",
+    "http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd",
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    "http://creativecommons.org/ns#",
+    "http://web.resource.org/cc/",
+    "http://purl.org/dc/elements/1.1/",
+}
+SVG_ATTRIBUTE_NAMESPACES = SVG_EDITOR_NAMESPACES | {"", XLINK_NS, XML_NS}
+SVG_ELEMENTS = set("""
+    svg g defs symbol use title desc metadata a
+    path rect circle ellipse line polyline polygon
+    text tspan textPath flowRoot flowRegion flowPara flowSpan
+    image
+    linearGradient radialGradient stop pattern marker clipPath mask
+    filter feGaussianBlur feOffset feBlend feFlood feComposite feMerge feMergeNode feColorMatrix
+    style
+""".split())
+SVG_MAX_DEPTH = 256
+SVG_CHUNK = 64 * 1024
+SVG_SNIFF_BYTES = 64 * 1024
+SVG_LINK_EDGE_CHARS = "".join(map(chr, range(0x21)))
+SVG_CSS_EXTERNAL_TOKENS = ("@import", "image-set(", "image(", "src(", "cross-fade(")
+# CSS leaves non-CSS whitespace in the address, where it can hide a relative path.
+SVG_CSS_LOCAL_URL = re.compile(r"""[ \t\n\r\f]*(['"]?)#[^\s'"()]*\1[ \t\n\r\f]*\)""")
 
 # journal lives next to the worker by default — the same file works unchanged
 # on the dev host (~/file-safety/) and on mycelium (/opt/mycelium/file-safety/)
@@ -635,6 +670,219 @@ def ooxml_check(fd, is_docx):
     return (len(reasons) == 0), sorted(reasons)
 
 
+def _refuse_svg_dtd(*_args):
+    raise _Refuse("svg_xml_dtd")
+
+
+def _svg_parser(encoding=None):
+    parser = xml.parsers.expat.ParserCreate(encoding=encoding, namespace_separator=" ")
+    parser.SetParamEntityParsing(xml.parsers.expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    parser.StartDoctypeDeclHandler = _refuse_svg_dtd
+    parser.EntityDeclHandler = _refuse_svg_dtd
+    parser.ExternalEntityRefHandler = _refuse_svg_dtd
+    return parser
+
+
+class _SvgSniffDone(Exception):
+    """Stop Expat before it parses anything beyond the routing decision."""
+
+
+def sniff_svg_root(fd):
+    def start_element(name, _attrs):
+        raise _SvgSniffDone(name.rpartition(" ")[2] == "svg")
+
+    def start_doctype(name, *_args):
+        # Even with another name, stop before Expat enters the internal subset.
+        raise _SvgSniffDone(name == "svg")
+
+    try:
+        parser = _svg_parser()
+        parser.StartElementHandler = start_element
+        parser.StartDoctypeDeclHandler = start_doctype
+        parser.Parse(os.pread(fd, SVG_SNIFF_BYTES, 0), True)
+    except _SvgSniffDone as result:
+        return result.args[0]
+    except Exception:
+        pass
+    return False
+
+
+def _svg_png_has_exact_end(data):
+    if not data.startswith(b"\x89PNG\r\n\x1a\n") or not data.endswith(PNG_TAIL):
+        return False
+    # Follow chunk lengths so a second IEND cannot mask bytes after the first.
+    offset = 8
+    end = len(data) - len(PNG_TAIL)
+    while offset < end:
+        if data[offset + 4:offset + 8] == b"IEND":
+            return False
+        offset += 12 + int.from_bytes(data[offset:offset + 4], "big")
+    return offset == end
+
+
+def _svg_image_data_ok(image_type, payload):
+    encoded = "".join(payload.split())
+    # validate=True still accepts extra padding after an unpadded quartet.
+    if len(encoded) % 4 or encoded.endswith("==="):
+        return False
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    if image_type == "data:image/png;base64":
+        complete = _svg_png_has_exact_end(data)
+    else:
+        complete = data.startswith(b"\xff\xd8\xff") and data.endswith(JPEG_TAIL)
+    if not complete:
+        return False
+    active_exception = sys.exc_info()[1]
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)):
+            return False
+    except zipfile.BadZipFile as exc:
+        # ZipFile wraps a read failure in the same BadZipFile as a missing
+        # directory. An exception already handled by the caller is unrelated.
+        if exc.__cause__ is not None or (
+            exc.__context__ is not None and exc.__context__ is not active_exception
+        ):
+            raise
+        return True
+
+
+def _svg_href_reason(uri, local, value):
+    value = value.strip(SVG_LINK_EDGE_CHARS)
+    if uri == SVG_NS and local == "image":
+        header, comma, payload = value.partition(",")
+        header = header.lower()
+        if not header.startswith("data:"):
+            return "svg_image_external"
+        if not comma or header not in ("data:image/png;base64", "data:image/jpeg;base64"):
+            return "svg_image_type"
+        if not _svg_image_data_ok(header, payload):
+            return "svg_image_data"
+    elif not value.startswith("#"):
+        if uri != SVG_NS or local != "a":
+            return "svg_external_reference"
+        scheme, _, target = value.partition("://")
+        if (scheme.lower() not in ("http", "https") or not target
+                or any(ch.isspace() or ch <= "\x20" or "\x7f" <= ch <= "\x9f" for ch in value)):
+            return "svg_link_scheme"
+    return None
+
+
+def _svg_css_has_external(value):
+    value = value.lower()
+    if any(token in value for token in SVG_CSS_EXTERNAL_TOKENS):
+        return True
+    return any(SVG_CSS_LOCAL_URL.match(value, token.end()) is None
+               for token in re.finditer(r"url\(", value))
+
+
+class _SvgScan:
+    def __init__(self):
+        self.reasons = set()
+        self.depth = 0
+        self.style_starts = []
+        self.style_text = []
+
+    @staticmethod
+    def xml_decl(_version, encoding, _standalone):
+        if encoding is not None and encoding.lower() != "utf-8":
+            raise _Refuse("svg_encoding_not_utf8")
+
+    def processing_instruction(self, _target, _data):
+        self.reasons.add("svg_processing_instruction")
+
+    def css(self, value):
+        if "\\" in value:
+            self.reasons.add("svg_css_escape")
+        if _svg_css_has_external(value):
+            self.reasons.add("svg_css_external")
+
+    def start(self, name, attrs):
+        uri, _, local = name.rpartition(" ")
+        self.depth += 1
+        if self.depth > SVG_MAX_DEPTH:
+            raise _Refuse("svg_xml_too_deep")
+        if self.depth == 1 and (uri, local) != (SVG_NS, "svg"):
+            raise _Refuse("svg_root_not_svg")
+        if uri == SVG_NS:
+            if local not in SVG_ELEMENTS:
+                self.reasons.add("svg_element_not_allowed")
+            if local == "style":
+                self.style_starts.append(len(self.style_text))
+        elif uri not in SVG_EDITOR_NAMESPACES:
+            self.reasons.add("svg_foreign_namespace")
+
+        for attr, value in attrs.items():
+            attr_uri, _, attr_local = attr.rpartition(" ")
+            if attr_uri not in SVG_ATTRIBUTE_NAMESPACES:
+                self.reasons.add("svg_foreign_namespace")
+            if not attr_uri and attr_local.lower().startswith("on"):
+                self.reasons.add("svg_event_handler")
+            if (attr_uri, attr_local) == (XML_NS, "base"):
+                self.reasons.add("svg_xml_base")
+            if attr_local == "href" and attr_uri in ("", XLINK_NS):
+                reason = _svg_href_reason(uri, local, value)
+                if reason:
+                    self.reasons.add(reason)
+            elif uri == SVG_NS and not attr_uri:
+                self.css(value)
+
+    def chars(self, data):
+        if self.style_starts:
+            # Share text between nested styles so each receives all descendant
+            # text without keeping a separate copy for every enclosing style.
+            self.style_text.append(data)
+
+    def end(self, name):
+        if name == SVG_NS + " style":
+            self.css("".join(self.style_text[self.style_starts.pop():]))
+            if not self.style_starts:
+                self.style_text.clear()
+        self.depth -= 1
+
+
+def svg_check(fd):
+    """Check the SVG allowlist on the original descriptor and fail closed."""
+    try:
+        scan = _SvgScan()
+        parser = _svg_parser(encoding="UTF-8")
+        parser.XmlDeclHandler = scan.xml_decl
+        parser.StartElementHandler = scan.start
+        parser.EndElementHandler = scan.end
+        parser.CharacterDataHandler = scan.chars
+        parser.ProcessingInstructionHandler = scan.processing_instruction
+        parser.buffer_text = True
+
+        try:
+            chunk = os.pread(fd, SVG_CHUNK, 0)
+            if chunk.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+                raise _Refuse("svg_encoding_not_utf8")
+            # Without a BOM Expat can autodetect UTF-16 even when given "UTF-8".
+            # Pin its input encoding without changing the declaration or file bytes.
+            parser.Parse(codecs.BOM_UTF8, False)
+            if chunk.startswith(codecs.BOM_UTF8):
+                chunk = chunk[len(codecs.BOM_UTF8):]
+                offset = len(chunk) + len(codecs.BOM_UTF8)
+            else:
+                offset = len(chunk)
+            while chunk:
+                parser.Parse(chunk, False)
+                chunk = os.pread(fd, SVG_CHUNK, offset)
+                offset += len(chunk)
+            parser.Parse(b"", True)
+        except _Refuse as refusal:
+            scan.reasons.add(str(refusal))
+        except xml.parsers.expat.ExpatError:
+            scan.reasons.add("svg_xml_malformed")
+        except Exception:
+            scan.reasons.add("svg_parse_error")
+        return not scan.reasons, sorted(scan.reasons)
+    except Exception:
+        return False, ["svg_parse_error"]
+
+
 def webp_length_reasons(fd, size):
     """Exact-length rule for WebP: the file must end where its RIFF header says.
     Chunk padding lives inside that bound, so no extra pad byte is allowed after it.
@@ -720,6 +968,10 @@ def static_gate(fd, mime, size):
         ok, ooxml_reasons = ooxml_check(fd, is_docx=(mime == DOCX_MIME))
         if not ok:
             reasons.extend(ooxml_reasons)
+
+    if mime == SVG_MIME:
+        _, svg_reasons = svg_check(fd)
+        reasons.extend(svg_reasons)
 
     status = "reject" if reasons else "ok"
     return status, reasons
@@ -836,7 +1088,13 @@ def _check_open_file(path, fd, ts):
             static_status = "reject"
             static_reasons = [f"size_{size}_exceeds_{MAX_FILE_SIZE_BYTES}"]
         else:
+            if mime.startswith("text/") and sniff_svg_root(fd):
+                mime = SVG_MIME
             static_status, static_reasons = static_gate(fd, mime, size)
+            # An opener may infer SVG from the name even when sniffing missed it.
+            if mime != SVG_MIME and os.path.basename(path).rstrip(" .").lower().endswith(".svg"):
+                static_status = "reject"
+                static_reasons.append("svg_name_not_svg_content")
 
     # AV/LLM gates only make sense to run once static passes — no point
     # scanning something we're already rejecting on structural grounds.
