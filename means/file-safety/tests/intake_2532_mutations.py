@@ -13,7 +13,6 @@ from intake_2532_cases import CASES, base
 POLL = "intake_poller.py"
 DAEMON = "triage_daemon.py"
 CONVERTER = "md_convert.py"
-ROLLBACK = "rollback_r4.sh"
 DEPLOY_LIB = "deploy_r4_lib.py"
 TESTS = Path(__file__).resolve().parent
 CASE_FILE = "intake_2532_cases.py"
@@ -25,6 +24,7 @@ CATEGORIES = '("Cc", "Cf", "Zl", "Zp")'
 SEPARATORS = 'ch in "/\\\\\\0"'
 ENTRY = "entry = md_name if path == md and md_name else os.path.relpath(path, root)"
 ARCHIVE_OPEN = 'with open(path, "rb") as src, archive.open(entry, "w")'
+ROLLBACK_MATCH = r"\.[^.].*\.md-name"
 UTF8_BIT_DROPPED = (
     'class EntryWithoutFlag(zipfile.ZipInfo):\n'
     '                def _encodeFilenameFlags(self):\n'
@@ -111,10 +111,14 @@ MUTATIONS = [
      'md = os.path.join(outdir, stem + ".md")', 'md = os.path.join(outdir, md_name or stem + ".md")'),
     (CONVERTER, "UTF-8 bit cleared", "russian-docx",
      "            " + ARCHIVE_OPEN, "            " + UTF8_BIT_DROPPED),
-    (ROLLBACK, "rollback stops the worker without draining", "rollback-queue",
-     'python3 "$r4_lib" drain "$backup" rollback\n', ""),
-    (DEPLOY_LIB, "rollback ignores outstanding sidecars", "rollback-sidecar-timeout",
-     "if rollback or not e.name.startswith('.')", "if not e.name.startswith('.')"),
+    (DEPLOY_LIB, "rollback leaves Markdown name sidecars", "rollback-only-md-names",
+     "            path.unlink()\n", ""),
+    (DEPLOY_LIB, "rollback also removes kind sidecars", "rollback-only-md-names",
+     ROLLBACK_MATCH, r"\.[^.].*\.(?:md-name|kind)"),
+    (DEPLOY_LIB, "rollback follows a sidecar symlink", "rollback-symlink",
+     "path.lstat().st_mode", "path.stat().st_mode"),
+    (DEPLOY_LIB, "rollback omits the removal list", "rollback-only-md-names",
+     "log.write(json.dumps(path.name) + '\\n')", "pass"),
 ]
 
 
@@ -131,19 +135,21 @@ def main():
         tests.mkdir()
         code.mkdir()
         for name in (CASE_FILE, "md_convert_cases.py", ROLLBACK_CASE_FILE, "deploy_r4_cases.py",
-                     "deploy_r4.sh", "r4_common.sh", "check_deploy.py"):
+                     "deploy_r4.sh", "rollback_r4.sh", "r4_common.sh", "check_deploy.py"):
             shutil.copyfile(TESTS / name, tests / name)
         targets = {**{name: code / name for name in (POLL, DAEMON, CONVERTER)},
-                   **{name: tests / name for name in (ROLLBACK, DEPLOY_LIB)}}
+                   DEPLOY_LIB: tests / DEPLOY_LIB}
         for name, target in targets.items():
             directory = base.CODE if target.parent == code else TESTS
             shutil.copyfile(directory / name, target)
         control = run(tests, CASE_FILE)
         assert control.returncode == 0 and f"2532: {len(CASES)} PASS, 0 FAIL, 0 SKIP" in control.stdout, (
             control.stdout, control.stderr)
-        control = run(tests, ROLLBACK_CASE_FILE)
+        rollback_cases = dict.fromkeys(case for module, _, case, _, _ in MUTATIONS if module == DEPLOY_LIB)
+        control = run(tests, ROLLBACK_CASE_FILE, *rollback_cases)
         assert control.returncode == 0, (control.stdout, control.stderr)
-        killed = survived = 0
+        killed = {CASE_FILE: 0, ROLLBACK_CASE_FILE: 0}
+        survived = killed.copy()
         for module, title, case, old, new in MUTATIONS:
             target = targets[module]
             source = target.read_text(encoding="utf-8")
@@ -152,23 +158,22 @@ def main():
                 anchor = '        if kind:\n            sidecars = [(".kind", kind)]'
                 mutant = replace_once(mutant, anchor, old + anchor)
             target.write_text(mutant, encoding="utf-8")
-            if target.suffix == ".sh":
-                subprocess.run(["bash", "-n", str(target)], check=True)
-            else:
-                compile(mutant, f"{module}:{title}", "exec")
-            case_file = ROLLBACK_CASE_FILE if case.startswith("rollback-") else CASE_FILE
+            compile(mutant, f"{module}:{title}", "exec")
+            case_file = ROLLBACK_CASE_FILE if module == DEPLOY_LIB else CASE_FILE
             result = run(tests, case_file, case)
             target.write_text(source, encoding="utf-8")
             if result.returncode == 1 and f"FAIL {case}:" in result.stdout:
-                killed += 1
+                killed[case_file] += 1
                 print(f"KILLED {module}: {title} [{case}]", flush=True)
             elif result.returncode == 0 and f"PASS {case}" in result.stdout:
-                survived += 1
+                survived[case_file] += 1
                 print(f"SURVIVED {module}: {title} [{case}]", flush=True)
             else:
                 raise AssertionError((title, result.stdout, result.stderr))
-        print(f"mutations 2532: {killed} KILLED, {survived} SURVIVED")
-        return bool(survived)
+        for case_file in killed:
+            print(f"mutations {case_file}: {killed[case_file]} KILLED, {survived[case_file]} SURVIVED")
+        print(f"mutations 2532: {sum(killed.values())} KILLED, {sum(survived.values())} SURVIVED")
+        return any(survived.values())
 
 
 if __name__ == "__main__":

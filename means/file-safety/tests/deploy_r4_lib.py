@@ -254,30 +254,22 @@ def snapshot(backup, tag):
     return saved
 
 
-def drain(backup, mode='deploy'):
-    rollback = mode == 'rollback'
-    tag_prefix = 'rollback-' if rollback else ''
-    snapshot(backup, tag_prefix + 'after-stop')
-    if not rollback:
-        # Catch blockers created since preflight immediately, before waiting for inbox.
-        transition_checks(inventory())
+def drain(backup):
+    # Catch blockers created since preflight immediately, before waiting for inbox.
+    snapshot(backup, 'after-stop')
+    transition_checks(inventory())
     deadline = time.monotonic() + (0.05 if TEST_ROOT else 300)
     while True:
+        subprocess.run(['systemctl', 'is-active', '--quiet', 'fs-triage-worker'], check=True)
         with os.scandir(TRIAGE / 'inbox') as entries:
-            # Rollback must also wait for the newer worker to remove its sidecars.
-            pending = [e.name for e in entries if rollback or not e.name.startswith('.')]
-        if pending and time.monotonic() >= deadline:
-            snapshot(backup, tag_prefix + 'drain-timeout')
-            raise ValueError(f'drain timeout (300s); pending={pending!r}; keep intake stopped, reconcile queues')
-        if pending or not rollback:
-            subprocess.run(['systemctl', 'is-active', '--quiet', 'fs-triage-worker'], check=True)
+            pending = [e.name for e in entries if not e.name.startswith('.')]
         if not pending:
-            break
+            break  # process() removes the source only in its final cleanup.
+        if time.monotonic() >= deadline:
+            snapshot(backup, 'drain-timeout')
+            raise ValueError(f'drain timeout (300s); pending={pending!r}; keep intake stopped, reconcile queues')
         time.sleep(0.01 if TEST_ROOT else 1)
-    state = snapshot(backup, tag_prefix + 'drained')
-    if rollback:
-        # Intake is stopped. Leave completed results in outbox for reconciliation.
-        return
+    state = snapshot(backup, 'drained')
     transition_checks(state['queues'])
     # Orphaned output, dot-partials/kind, incoming data cannot be silently re-enqueued.
     leftovers = {p: entries for p, entries in state['queues'].items()
@@ -287,6 +279,22 @@ def drain(backup, mode='deploy'):
                      for e in entries)}
     require(not leftovers, f'unfinished/orphan queue entries: {leftovers!r}; reconcile using state snapshots')
     (Path(backup) / 'offset-drained-value').write_text(str(state['offset']))
+
+
+def rollback_md_names(backup):
+    inbox = TRIAGE / 'inbox'
+    attrs(inbox, directory=True)
+    sidecars = sorted(path for path in inbox.iterdir()
+                      if re.fullmatch(r'\.[^.].*\.md-name', path.name, re.DOTALL))
+    # Validate the entire set before touching the queue or restoring files.
+    for path in sidecars:
+        require(stat.S_ISREG(path.lstat().st_mode), f'{path}: expected a regular file (no symlinks)')
+    # Keep earlier removals if the same backup is used to retry rollback.
+    with (Path(backup) / 'rollback-md-names.jsonl').open('a', encoding='utf-8', buffering=1) as log:
+        for path in sidecars:
+            path.unlink()
+            log.write(json.dumps(path.name) + '\n')
+    print(f'Rollback removed {len(sidecars)} .md-name sidecar(s)')
 
 
 def ensure_dirs():
@@ -323,6 +331,8 @@ def main():
         snapshot(*args)
     elif action == 'drain':
         drain(*args)
+    elif action == 'rollback-md-names':
+        rollback_md_names(*args)
     elif action == 'dirs':
         ensure_dirs()
     elif action == 'drop':

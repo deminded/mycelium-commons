@@ -3,25 +3,45 @@
 import json
 import os
 from pathlib import Path
+import re
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
 from unittest import mock
 import zipfile
 
-from deploy_r4_cases import Fixture, assert_failure
+from deploy_r4_cases import GROUP_ID, Fixture, assert_failure
 from intake_2532_cases import PDF, base, sidecar
 
 JOB = "7_input.pdf"
 MD_NAME = "Отчёт.pdf.md"
+LEGACY = "1b79927"
+LOG = "rollback-md-names.jsonl"
 
 
-def setup(root):
+def installed_files(fixture):
+    paths = (fixture.triage / "triage_daemon.py", fixture.triage / "md_convert.py",
+             fixture.intake / "intake_poller.py", fixture.drop)
+    return {path: path.read_bytes() for path in paths if path.exists()}
+
+
+def setup(root, *, legacy=False):
     fixture = Fixture(root / "server", prior=True)
+    if legacy:
+        for path in (fixture.triage / "triage_daemon.py", fixture.triage / "md_convert.py",
+                     fixture.intake / "intake_poller.py"):
+            source = subprocess.check_output([
+                "git", "-C", str(fixture.tests), "show", f"{LEGACY}:means/file-safety/code/{path.name}",
+            ])
+            if path.name == "intake_poller.py":
+                source = re.sub(rb"^GROUP_ID = .*$", f"GROUP_ID = {GROUP_ID}".encode(), source, flags=re.M)
+            path.write_bytes(source)
+    original = installed_files(fixture)
     result = fixture.deploy()
     assert result.returncode == 0, result.stdout + result.stderr
     fixture.reset()
-    return fixture
+    return fixture, original
 
 
 def enqueue(fixture):
@@ -37,7 +57,7 @@ def enqueue(fixture):
     assert sidecar(inbox, JOB).read_text(encoding="utf-8") == MD_NAME + "\n"
 
 
-def model_worker(fixture):
+def restored_process(fixture):
     triage = fixture.triage
     reader = fixture.root / "reader.py"
     reader.write_text('print(\'{"summary":"","flags":[]}\')\n')
@@ -48,77 +68,135 @@ def model_worker(fixture):
     command = [sys.executable, "-c", "import triage_daemon, json, sys; "
                "triage_daemon.process(sys.argv[1], **json.loads(sys.argv[2]))",
                JOB, json.dumps(paths)]
-    model = fixture.root / "bin/model"
-    source = triage / "inbox" / JOB
-    hook = f"""if name=='systemctl' and args==['is-active','--quiet','fs-triage-worker']:
-    assert state['units']['mycelium-intake']=='inactive'
-    assert state['units']['fs-triage-worker']=='active'
-    if pathlib.Path({str(source)!r}).is_file():
-        subprocess.run({command!r}, cwd={str(triage)!r}, check=True)
-"""
-    anchor = "if name=='systemctl':"
-    model.write_text(model.read_text().replace(anchor, hook + anchor, 1))
+    subprocess.run(command, cwd=triage, env=fixture.env, check=True)
 
 
-def rollback_queue(root):
+def assert_rollback_order(fixture):
+    calls = fixture.model()["calls"]
+    stop_intake = calls.index(["systemctl", "stop", "mycelium-intake"])
+    stop_worker = calls.index(["systemctl", "stop", "fs-triage-worker"])
+    cleanup = next(i for i, call in enumerate(calls) if call[0] == "python3" and call[2] == "rollback-md-names")
+    install = next(i for i, call in enumerate(calls) if call[0] == "install")
+    start_worker = calls.index(["systemctl", "start", "fs-triage-worker"])
+    start_intake = calls.index(["systemctl", "start", "mycelium-intake"])
+    assert stop_intake < stop_worker < cleanup < install < start_worker < start_intake, calls
+    assert not any(call[:2] == ["systemctl", "is-active"] and call[-1] == "fs-triage-worker"
+                   for call in calls), calls
+
+
+def assert_removed(result, backup, *names):
+    assert f"Rollback removed {len(names)} .md-name sidecar(s)" in result.stdout, result.stdout
+    log = backup / LOG
+    assert log.is_file(), f"missing removal log: {log}"
+    assert [json.loads(line) for line in log.read_text().splitlines()] == sorted(names)
+
+
+def rollback_inactive_worker(root):
     base.require("pdftotext", "pdfimages")
-    fixture = setup(root)
+    fixture, original = setup(root, legacy=True)
     backup = fixture.backup()
     deploy_files = {path: path.read_bytes() for path in backup.iterdir()}
     # A live deployment may have advanced the offset and journal since its snapshot.
     (fixture.intake / ".intake_offset").write_text("43\n")
     (fixture.intake / "journal.log").write_text("keep journal\nnew intake\n")
     enqueue(fixture)
-    model_worker(fixture)
+    inbox, outbox = fixture.triage / "inbox", fixture.triage / "outbox"
+    md_name = sidecar(inbox, JOB)
+    remaining = {name: (inbox / name).read_bytes() for name in (JOB, f".{JOB}.kind")}
+    state = fixture.model()
+    state["units"]["fs-triage-worker"] = "inactive"
+    (fixture.root / "model.json").write_text(json.dumps(state))
 
     result = fixture.rollback(backup)
     assert result.returncode == 0, result.stdout + result.stderr
-    inbox, outbox = fixture.triage / "inbox", fixture.triage / "outbox"
-    assert not list(inbox.iterdir()), list(inbox.iterdir())
-    before = json.loads((backup / "state-rollback-after-stop.json").read_text())
-    assert {entry["name"] for entry in before["queues"][str(inbox)]} == {
-        JOB, "." + JOB + ".kind", "." + JOB + ".md-name",
-    }
-    drained = json.loads((backup / "state-rollback-drained.json").read_text())
-    assert drained["queues"][str(inbox)] == [] and drained["offset"] == 43
+    assert_rollback_order(fixture)
+    assert installed_files(fixture) == original
+    assert {path.name: path.read_bytes() for path in inbox.iterdir()} == remaining
+    assert_removed(result, backup, md_name.name)
     assert all(path.read_bytes() == data for path, data in deploy_files.items())
-    assert (fixture.triage / "triage_daemon.py").read_bytes() == fixture.original["triage_daemon.py"][0]
+    assert (fixture.intake / ".intake_offset").read_text() == "43\n"
+    assert (fixture.intake / "journal.log").read_text() == "keep journal\nnew intake\n"
 
+    restored_process(fixture)
+    assert not list(inbox.iterdir()), list(inbox.iterdir())
     result_path = outbox / (JOB + ".json")
     zip_path = outbox / (JOB + ".md.zip")
     assert json.loads(result_path.read_text())["flags"] == []
     with zipfile.ZipFile(zip_path) as archive:
-        assert archive.namelist()[0] == MD_NAME, archive.namelist()
-    # Reconcile completed artifacts before deploying again, just as with r4 deploy.
+        assert archive.namelist()[0] == "7_input.md", archive.namelist()
     result_path.unlink()
     zip_path.unlink()
+    fixture.reset()
     result = fixture.deploy()
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def rollback_timeout(root, sidecar_only=False):
-    fixture = setup(root)
+def rollback_stuck_worker(root):
+    # The model reports an active worker, but never removes any queue entries.
+    fixture, original = setup(root)
+    enqueue(fixture)
     inbox = fixture.triage / "inbox"
-    if sidecar_only:
-        sidecar(inbox, JOB).write_text(MD_NAME + "\n", encoding="utf-8")
+    result = fixture.rollback()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert_rollback_order(fixture)
+    assert installed_files(fixture) == original
+    assert {path.name for path in inbox.iterdir()} == {JOB, f".{JOB}.kind"}
+
+
+def rollback_unexpected_type(root, *, symlink):
+    fixture, _ = setup(root)
+    installed = installed_files(fixture)
+    inbox = fixture.triage / "inbox"
+    normal = sidecar(inbox, JOB)
+    normal.write_text(MD_NAME + "\n", encoding="utf-8")
+    invalid = sidecar(inbox, "9_input.pdf")
+    target = root / "symlink-target"
+    if symlink:
+        target.write_text("keep target\n")
+        invalid.symlink_to(target)
     else:
-        enqueue(fixture)
+        invalid.mkdir()
 
     result = fixture.rollback()
     assert_failure(result)
-    assert "phase=rollback-drain" in result.stderr and "drain timeout" in result.stderr, result.stderr
-    assert "keep intake stopped" in result.stderr
+    assert "phase=rollback-md-names" in result.stderr, result.stderr
+    assert f"{invalid}: expected a regular file (no symlinks)" in result.stderr, result.stderr
     state = fixture.model()
-    assert state["units"] == {"mycelium-intake": "inactive", "fs-triage-worker": "active"}, state
-    assert not any(call[0] == "install" for call in state["calls"]), state
-    assert (fixture.backup() / "state-rollback-drain-timeout.json").is_file()
-    assert sidecar(inbox, JOB).is_file()
+    assert state["units"] == {"mycelium-intake": "inactive", "fs-triage-worker": "inactive"}, state
+    assert installed_files(fixture) == installed
+    assert normal.read_text(encoding="utf-8") == MD_NAME + "\n"
+    assert not (fixture.backup() / LOG).exists()
+    if symlink:
+        assert invalid.is_symlink() and target.read_text() == "keep target\n"
+    else:
+        assert invalid.is_dir()
+
+
+def rollback_only_md_names(root):
+    fixture, _ = setup(root)
+    enqueue(fixture)
+    inbox = fixture.triage / "inbox"
+    md_name = sidecar(inbox, JOB)
+    orphan = sidecar(inbox, "9_orphan.pdf")
+    orphan.write_text("orphan.md\n")
+    for name in (f"{md_name.name}.partial", f"{md_name.name}.{'f' * 48}.partial",
+                 ".other", ".md-name", "..md-name", "..hidden.md-name", "visible.md-name"):
+        (inbox / name).write_text(name)
+    removed = (md_name.name, orphan.name)
+    remaining = {path.name: path.read_bytes() for path in inbox.iterdir() if path.name not in removed}
+
+    result = fixture.rollback()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert {path.name: path.read_bytes() for path in inbox.iterdir()} == remaining
+    assert_removed(result, fixture.backup(), *removed)
 
 
 CASES = {
-    "rollback-queue": rollback_queue,
-    "rollback-timeout": rollback_timeout,
-    "rollback-sidecar-timeout": lambda root: rollback_timeout(root, sidecar_only=True),
+    "rollback-inactive-worker": rollback_inactive_worker,
+    "rollback-stuck-worker": rollback_stuck_worker,
+    "rollback-symlink": lambda root: rollback_unexpected_type(root, symlink=True),
+    "rollback-directory": lambda root: rollback_unexpected_type(root, symlink=False),
+    "rollback-only-md-names": rollback_only_md_names,
 }
 
 

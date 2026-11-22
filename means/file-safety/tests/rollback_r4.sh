@@ -8,10 +8,10 @@ backup="$1"
 python3 "$r4_lib" validate-backup "$backup"
 phase=rollback-stop-intake
 systemctl stop mycelium-intake
-phase=rollback-drain
-python3 "$r4_lib" drain "$backup" rollback
 phase=rollback-stop-worker
 systemctl stop fs-triage-worker
+phase=rollback-md-names
+python3 "$r4_lib" rollback-md-names "$backup"
 phase=rollback-files
 for r4_name in triage_daemon.py md_convert.py intake_poller.py; do
     r4_directory="$r4_triage"
@@ -43,5 +43,4 @@ phase=rollback-start-intake
 systemctl start mycelium-intake
 phase=rollback-status
 systemctl is-active mycelium-intake
-systemctl is-active fs-triage-worker
 printf 'PASS r4 rollback; backup=%s; runtime snapshots retained for reconciliation\n' "$backup"
