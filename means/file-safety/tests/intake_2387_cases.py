@@ -66,7 +66,7 @@ def scenario(source, size=None, failure=None, thread=True, loop=False, reject=Fa
             assert file_id == 'file-id'
             Path(path).write_bytes(b'original')
 
-        def triage(path, mime):
+        def triage(path, mime, _original_name):
             assert mime == label['mime']
             if size is not None:
                 with open(path + '.md.zip', 'wb') as stream:

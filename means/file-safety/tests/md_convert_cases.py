@@ -462,7 +462,7 @@ def intake_label_case(root):
     def download(file_id, dest):
         Path(dest).write_text("original")
 
-    def triage(path, mime):
+    def triage(path, mime, _original_name):
         Path(path + ".md.zip").write_bytes(b"archive")
         return {"summary": "preview", "flags": [], "converted": metadata}
 

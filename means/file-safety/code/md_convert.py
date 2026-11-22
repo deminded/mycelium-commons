@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import time
+import unicodedata
 import zipfile
 
 # Bound parser work and expanded DOCX/PDF media: small inputs can expand to GBs.
@@ -30,6 +31,8 @@ SCAN_TIMEOUT = 1
 SIGNAL_TIMEOUT = 1  # Reserved afresh after each scan, including an expired scan.
 OUTPUT_POLL_SECONDS = 0.2
 CONVERT_TIMEOUT = 60  # One budget shared by all tools, validation and ZIP writing.
+# Sized for intake_poller.ATTACHMENT_NAME_BYTES plus the ".md" suffix.
+MAX_ARCHIVE_MD_NAME_BYTES = 180 + len(".md")
 
 
 class OutputCap(Exception):
@@ -258,14 +261,27 @@ def output_files(md, media, flags, deadline=None):
     return files, media_count
 
 
-def make_archive(md, media, dest, flags, deadline):
+def valid_md_name(name):
+    try:
+        size = len(name.encode("utf-8"))
+    except UnicodeEncodeError:
+        return False
+    return (0 < size <= MAX_ARCHIVE_MD_NAME_BYTES
+            and name not in (".", "..")
+            and not any(ch in "/\\\0" or unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp")
+                        for ch in name))
+
+
+def make_archive(md, media, dest, flags, deadline, md_name=None):
     files, media_count = output_files(md, media, flags, deadline)
     root = os.path.dirname(md)
     with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in files:
             remaining(deadline)
+            # ZipFile stores non-ASCII entry names as UTF-8 with bit 11 set.
+            entry = md_name if path == md and md_name else os.path.relpath(path, root)
             # Stream in bounded chunks and check the common timeout while zipping.
-            with open(path, "rb") as src, archive.open(os.path.relpath(path, root), "w") as out:
+            with open(path, "rb") as src, archive.open(entry, "w") as out:
                 while True:
                     remaining(deadline)
                     chunk = src.read(64 * 1024)
@@ -276,7 +292,7 @@ def make_archive(md, media, dest, flags, deadline):
     return media_count
 
 
-def convert(src, kind, outdir):
+def convert(src, kind, outdir, md_name=None):
     result = {"ok": False, "md": "", "zip": "", "tool": "",
               "md_sha256": "", "md_bytes": 0, "media_count": 0, "flags": []}
     flags = result["flags"]
@@ -345,7 +361,10 @@ def convert(src, kind, outdir):
                     if path != md:
                         link = os.path.relpath(path, outdir).replace(os.sep, "/")
                         out.write(f"\n\n![{os.path.basename(path)}]({link})\n")
-        count = make_archive(md, media, dest, flags, deadline)
+        if md_name is not None and not valid_md_name(md_name):
+            flags.append("convert_invalid_md_name")
+            md_name = None
+        count = make_archive(md, media, dest, flags, deadline, md_name)
         with open(md, "rb") as stream:
             digest = hashlib.sha256()
             for chunk in iter(lambda: stream.read(64 * 1024), b""):
@@ -389,7 +408,7 @@ def convert(src, kind, outdir):
 
 
 def main():
-    if len(sys.argv) == 4:
+    if len(sys.argv) in (4, 5):
         result = convert(*sys.argv[1:])
     else:
         result = {"ok": False, "md": "", "zip": "", "tool": "", "md_sha256": "",

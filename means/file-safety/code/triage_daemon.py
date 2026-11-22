@@ -5,7 +5,8 @@ triage_daemon — inbox poller for the semantic gate (runs as uid fs-triage).
 The intake worker drops <name> into inbox/ (the file to triage) and the daemon
 answers with outbox/<name>.json = {summary, flags}. An optional .<name>.kind
 requests disposable conversion first; the reader then sees Markdown, and the
-archive is published as outbox/<name>.md.zip with metadata in the JSON. Each
+archive is published as outbox/<name>.md.zip with metadata in the JSON. An
+optional .<name>.md-name supplies the Markdown entry name in that archive. Each
 file is handed to a FRESH triage_reader.py process — one-shot, no shared state between files, so a
 reader corrupted by one file can't carry anything into the next.
 
@@ -23,7 +24,7 @@ import sys
 import tempfile
 import time
 
-from md_convert import MAX_OUTPUT_BYTES
+from md_convert import MAX_ARCHIVE_MD_NAME_BYTES, MAX_OUTPUT_BYTES
 
 INBOX = "/opt/mycelium/fs-triage/inbox"
 OUTBOX = "/opt/mycelium/fs-triage/outbox"
@@ -100,10 +101,26 @@ def cleanup_rejected(outbox=None):
     return visited
 
 
-def convert_file(src, kind, work, converter):
+def read_md_name(path):
+    try:
+        with open(path, "rb") as stream:
+            # Read at most the name, its optional newline, and one excess byte.
+            raw = stream.read(MAX_ARCHIVE_MD_NAME_BYTES + 2).removesuffix(b"\n")
+        if len(raw) > MAX_ARCHIVE_MD_NAME_BYTES or b"\0" in raw:  # argv cannot carry NUL.
+            return ""
+        name = raw.decode("utf-8")
+        return name if name.splitlines() == [name] else ""
+    except (OSError, UnicodeError):
+        return ""
+
+
+def convert_file(src, kind, work, converter, md_name=""):
+    args = [sys.executable, converter, src, kind, work]
+    if md_name:
+        args.append(md_name)
     # A process group lets the daemon stop the converter AND its parser on timeout.
     with subprocess.Popen(
-        [sys.executable, converter, src, kind, work],
+        args,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         start_new_session=True,
     ) as proc:
@@ -137,6 +154,7 @@ def process(name, *, inbox=None, outbox=None, work_root=None, reader=None, conve
     work_root = work_root or WORK_ROOT
     src = os.path.join(inbox, name)
     kind_path = os.path.join(inbox, "." + name + ".kind")
+    md_name_path = os.path.join(inbox, "." + name + ".md-name")
     out = os.path.join(outbox, name + ".json")
     tmp = out + ".tmp"
     zip_out = os.path.join(outbox, name + ".md.zip")
@@ -164,7 +182,7 @@ def process(name, *, inbox=None, outbox=None, work_root=None, reader=None, conve
                     except OSError as exc:
                         raise WorkUnavailable() from exc
                     work = os.path.realpath(tempfile.mkdtemp(prefix="convert-", dir=work_root))
-                    conversion = convert_file(src, kind, work, converter)
+                    conversion = convert_file(src, kind, work, converter, read_md_name(md_name_path))
                     conversion_flags = conversion["flags"]
                     if not conversion["ok"]:
                         result = {"summary": "", "flags": conversion_flags}
@@ -204,7 +222,7 @@ def process(name, *, inbox=None, outbox=None, work_root=None, reader=None, conve
     finally:
         if work is not None:
             shutil.rmtree(work, ignore_errors=True)
-        for path in (src, kind_path, tmp, zip_tmp):
+        for path in (src, kind_path, md_name_path, tmp, zip_tmp):
             try:
                 os.remove(path)   # inbox is a queue, not storage
             except OSError:

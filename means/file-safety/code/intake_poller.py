@@ -252,7 +252,7 @@ def read_outbox_result(path):
         discard_outbox(path)
 
 
-def triage(quarantined_path, mime):
+def triage(quarantined_path, mime, original_name=None):
     """Run the semantic gate on quarantined text or a convertible file. Returns
     {summary, flags} (plus optional converted metadata) or a SKIPPED-shaped dict.
     Never raises or returns a verdict. Unsupported MIME types skip explicitly."""
@@ -264,8 +264,6 @@ def triage(quarantined_path, mime):
     # Pin the queue; create fresh inodes even if the producer preplants names.
     queue_fd = None
     owned = set()
-    kind_name = "." + name + ".kind"
-    kind_published = False
     try:
         try:
             triage_gid = grp.getgrnam("fs-triage").gr_gid
@@ -280,21 +278,24 @@ def triage(quarantined_path, mime):
             os.fchown(target.fileno(), -1, triage_gid)
             shutil.copyfileobj(source, target)
         if kind:
-            kind_partial = "." + name + ".kind." + secrets.token_hex(24) + ".partial"
-            fd = os.open(kind_partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                         0o640, dir_fd=queue_fd)
-            owned.add(kind_partial)
-            with os.fdopen(fd, "wb") as target:
-                os.fchown(target.fileno(), -1, triage_gid)
-                target.write((kind + "\n").encode("ascii"))
-            os.rename(kind_partial, kind_name, src_dir_fd=queue_fd, dst_dir_fd=queue_fd)
-            owned.remove(kind_partial)
-            kind_published = True
+            sidecars = [(".kind", kind)]
+            if original_name is not None:
+                sidecars.append((".md-name", attachment_name(original_name) + ".md"))
+            for suffix, value in sidecars:
+                sidecar = "." + name + suffix
+                sidecar_partial = sidecar + "." + secrets.token_hex(24) + ".partial"
+                fd = os.open(sidecar_partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o640, dir_fd=queue_fd)
+                owned.add(sidecar_partial)
+                with os.fdopen(fd, "wb") as target:
+                    os.fchown(target.fileno(), -1, triage_gid)
+                    target.write((value + "\n").encode("utf-8"))
+                os.rename(sidecar_partial, sidecar, src_dir_fd=queue_fd, dst_dir_fd=queue_fd)
+                owned.remove(sidecar_partial)
+                owned.add(sidecar)
         os.rename(partial, name, src_dir_fd=queue_fd, dst_dir_fd=queue_fd)
-        owned.remove(partial)
+        owned.clear()  # The daemon owns the published job and its sidecars now.
     except Exception as e:
-        if kind_published:
-            owned.add(kind_name)
         return {"status": f"SKIPPED:handoff_failed:{type(e).__name__}"}
     finally:
         if queue_fd is not None:
@@ -529,7 +530,7 @@ def handle_file(msg):
         # Phase 4: semantic triage of the quarantined file. Its result is a
         # signal for the owner, never a verdict — quarantine stays quarantine.
         # mime comes from the label (the worker sniffed it), not a local var.
-        tri = triage(qdest, str(label.get("mime", "")))
+        tri = triage(qdest, str(label.get("mime", "")), name)
         tri_line = ""
         if "converted" in tri:
             label["converted"] = tri["converted"]
