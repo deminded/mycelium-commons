@@ -80,8 +80,10 @@ def assert_rollback_order(fixture):
     start_worker = calls.index(["systemctl", "start", "fs-triage-worker"])
     start_intake = calls.index(["systemctl", "start", "mycelium-intake"])
     assert stop_intake < stop_worker < cleanup < install < start_worker < start_intake, calls
-    assert not any(call[:2] == ["systemctl", "is-active"] and call[-1] == "fs-triage-worker"
-                   for call in calls), calls
+    # No wait on the worker being rolled back; only the restored worker is checked after its start.
+    checks = [i for i, call in enumerate(calls)
+              if call[:2] == ["systemctl", "is-active"] and call[-1] == "fs-triage-worker"]
+    assert len(checks) == 1 and checks[0] > start_worker, calls
 
 
 def assert_removed(result, backup, *names):

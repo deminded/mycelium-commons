@@ -43,4 +43,5 @@ phase=rollback-start-intake
 systemctl start mycelium-intake
 phase=rollback-status
 systemctl is-active mycelium-intake
+systemctl is-active fs-triage-worker
 printf 'PASS r4 rollback; backup=%s; runtime snapshots retained for reconciliation\n' "$backup"
