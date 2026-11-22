@@ -182,8 +182,14 @@ def process(name, *, inbox=None, outbox=None, work_root=None, reader=None, conve
                     except OSError as exc:
                         raise WorkUnavailable() from exc
                     work = os.path.realpath(tempfile.mkdtemp(prefix="convert-", dir=work_root))
-                    conversion = convert_file(src, kind, work, converter, read_md_name(md_name_path))
-                    conversion_flags = conversion["flags"]
+                    md_name = read_md_name(md_name_path)
+                    try:
+                        os.fsencode(md_name)
+                    except UnicodeEncodeError:
+                        md_name = ""
+                        conversion_flags.append("convert_md_name_encoding")
+                    conversion = convert_file(src, kind, work, converter, md_name)
+                    conversion_flags.extend(conversion["flags"])
                     if not conversion["ok"]:
                         result = {"summary": "", "flags": conversion_flags}
                     else:

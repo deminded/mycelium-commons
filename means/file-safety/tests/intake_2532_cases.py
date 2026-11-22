@@ -15,6 +15,7 @@ import md_convert_cases as base
 
 PDF = "application/pdf"
 DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+HTML = "text/html"
 NAME_LIMIT = 180 + len(".md")
 SIDECAR = ".md-name"
 INVALID_NAME = "convert_invalid_md_name"
@@ -41,22 +42,32 @@ def setup(root):
     return intake, paths
 
 
-def end_to_end(root, original, expected, mime=PDF):
+def write_html(path):
+    path.write_text("<h1>Hello HTML triage</h1>", encoding="utf-8")
+
+
+def end_to_end(root, original, expected, mime=PDF, *, fail_name_rename=False):
     intake, paths = setup(root)
     inbox = root / "inbox"
     queued = "7_" + intake.safe_name(original)
     quarantine = root / "quarantine" / queued
     archive_path = Path(str(quarantine) + ".md.zip")
-    fixture = base.write_docx if mime == DOCX else base.write_pdf
+    fixture = {PDF: base.write_pdf, DOCX: base.write_docx, HTML: write_html}[mime]
+    legacy_name = mc.safe_stem(queued) + ".md"
+    entry_name = legacy_name if fail_name_rename else expected
     actual_rename = os.rename
     actual_run = subprocess.run
     entries = {}
 
     def rename(src, dst, **kw):
+        if fail_name_rename and kw and dst.endswith(SIDECAR):
+            raise PermissionError("sidecar publication failed")
         actual_rename(src, dst, **kw)
         if dst == queued and kw.get("dst_dir_fd") is not None:
             for entry in inbox.iterdir():
                 assert entry.name.isascii(), entry
+            if fail_name_rename:
+                assert {p.name for p in inbox.iterdir()} == {queued, "." + queued + ".kind"}
             path = sidecar(inbox, queued)
             if path.exists():
                 entries["sidecar"] = path.read_bytes()
@@ -81,15 +92,18 @@ def end_to_end(root, original, expected, mime=PDF):
     send.assert_called_once_with(1, str(archive_path), expected + ".zip", 7, thread_id=None)
     assert quarantine.is_file() and quarantine.name.isascii()
     assert not list(inbox.iterdir()) and not list((root / "outbox").iterdir())
-    legacy_name = mc.safe_stem(queued) + ".md"
     with zipfile.ZipFile(archive_path) as archive:
         names = archive.namelist()
-        assert expected in names and legacy_name not in names, names
-        if not expected.isascii():
-            assert archive.getinfo(expected).flag_bits & 0x800, names
-        text = archive.read(expected).decode("utf-8")
+        assert names[0] == entry_name and (legacy_name in names) == fail_name_rename, names
+        if not entry_name.isascii():
+            assert archive.getinfo(entry_name).flag_bits & 0x800, names
+        text = archive.read(entry_name).decode("utf-8")
         assert archive.testzip() is None
-    assert entries == {"sidecar": (expected + "\n").encode("utf-8")}, entries
+        archive.extractall(root / "extracted")
+        extracted = root / "extracted" / entry_name
+        assert extracted.is_file()
+        assert extracted.read_bytes() == text.encode("utf-8")
+    assert entries == ({} if fail_name_rename else {"sidecar": (expected + "\n").encode("utf-8")}), entries
     label = json.loads(Path(str(quarantine) + ".safety.json").read_text())
     assert Path(label["llm_triage"]["summary"]).name == legacy_name, label
     return names, text, mc.safe_stem(queued)
@@ -120,6 +134,50 @@ def long_name(root):
         end_to_end(subroot, original, expected)
 
 
+def windows_names(root):
+    base.require("pandoc", "pdftotext", "pdfimages")
+    for number, (original, expected, mime) in enumerate((
+        ("NUL.pdf", "_NUL.pdf", PDF),
+        ("nul.PDF", "_nul.PDF", PDF),
+        ("com¹.docx", "_com¹.docx", DOCX),
+        ("LPT9.html", "_LPT9.html", HTML),
+        ("CONSOLE.pdf", "CONSOLE.pdf", PDF),
+        ("NULL.pdf", "NULL.pdf", PDF),
+        ("COM10.pdf", "COM10.pdf", PDF),
+    )):
+        subroot = root / str(number)
+        subroot.mkdir()
+        end_to_end(subroot, original, expected + ".md", mime)
+
+    intake = base.load_intake()
+    assert intake.attachment_name("Con") == "_Con"
+    for prefix in ("com", "LpT"):
+        for digit in "0123456789¹²³":
+            original = prefix + digit + ".part.pdf"
+            assert intake.attachment_name(original) == "_" + original
+    for original in ("PRN", "Aux"):
+        assert intake.attachment_name(original) == "_" + original
+    assert intake.attachment_name("NUL." + "я" * 100) == "_NUL." + "я" * 87
+    assert mc.valid_md_name("NUL.md")
+
+
+def leading_dots(root):
+    base.require("pdftotext", "pdfimages")
+    end_to_end(root, ".заметки.pdf", "_заметки.pdf.md")
+    assert base.load_intake().attachment_name("..") == "__"
+
+
+def html_queue(root):
+    base.require("pandoc")
+    _, text, _ = end_to_end(root, "Отчёт.html", "Отчёт.html.md", HTML)
+    assert "Hello HTML triage" in text, text
+
+
+def optional_name_failure(root):
+    base.require("pdftotext", "pdfimages")
+    end_to_end(root, "Отчёт.pdf", "Отчёт.pdf.md", fail_name_rename=True)
+
+
 def queue_job(root, payload, kind=b"pdf\n"):
     _, paths = setup(root)
     name = "7_input.pdf"
@@ -136,10 +194,33 @@ def fallback(root, payload):
     base.require("pdftotext", "pdfimages")
     name, paths = queue_job(root, payload)
     daemon.process(name, **paths)
-    with zipfile.ZipFile(root / "outbox" / (name + ".md.zip")) as archive:
-        assert "7_input.md" in archive.namelist(), archive.namelist()
+    assert_fallback(root, name, [])
+
+
+def assert_fallback(root, name, flags):
     result = base.assert_daemon_clean(root, name)
-    assert result["flags"] == [], result
+    archive_path = root / "outbox" / (name + ".md.zip")
+    assert archive_path.is_file(), result
+    with zipfile.ZipFile(archive_path) as archive:
+        assert "7_input.md" in archive.namelist(), archive.namelist()
+    assert result["flags"] == flags, result
+
+
+def ascii_argv(root):
+    base.require("pdftotext", "pdfimages")
+    name, paths = queue_job(root, "Отчёт.pdf.md\n".encode("utf-8"))
+    proc = subprocess.run(
+        [sys.executable, "-c",
+         "import json, sys; from intake_2532_cases import daemon; "
+         "assert sys.getfilesystemencoding() == 'ascii'; "
+         "daemon.process(sys.argv[1], **json.loads(sys.argv[2]))",
+         name, json.dumps(paths)],
+        cwd=Path(__file__).resolve().parent,
+        env=dict(os.environ, LC_ALL="C", PYTHONUTF8="0"),
+        capture_output=True, text=True, timeout=75,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert_fallback(root, name, ["convert_md_name_encoding"])
 
 
 def direct_invalid(root, invalid):
@@ -226,13 +307,15 @@ def handoff(root, mode):
     label = root / "quarantine" / (queued + ".safety.json")
     status = json.loads(label.read_text())["llm_triage"]
     metadata = ["." + queued + ".kind", sidecar(inbox, queued).name]
-    if mode.endswith("fails"):
+    if mode == "job-rename-fails":
         assert status == "SKIPPED:handoff_failed:PermissionError", status
         assert not list(inbox.iterdir()), list(inbox.iterdir())
-        assert published == (metadata[:1] if mode == "name-rename-fails" else metadata), published
+        assert published == metadata, published
     else:
         assert status == "SKIPPED:timeout", status
-        assert published == ([] if mode == "nonconvert" else metadata) + [queued], published
+        expected = {"nonconvert": [], "name-rename-fails": metadata[:1]}.get(mode, metadata)
+        assert published == expected + [queued], published
+        assert {p.name for p in inbox.iterdir()} == set(published)
     assert len(opened) == len(chowned) == (1 if mode == "nonconvert" else 3), (opened, chowned)
     for (partial, flags, permissions, fd), ownership in zip(opened, chowned):
         assert partial.startswith(".") and partial.endswith(".partial"), partial
@@ -288,9 +371,15 @@ CASES = {
     "russian-docx": russian_docx,
     "filtered": filtered,
     "long-name": long_name,
+    "windows-names": windows_names,
+    "leading-dots": leading_dots,
+    "html-queue": html_queue,
+    "optional-name-failure": optional_name_failure,
+    "ascii-argv": ascii_argv,
     "missing-sidecar": lambda root: fallback(root, None),
     "empty-sidecar": lambda root: fallback(root, b""),
     "oversize-sidecar": lambda root: fallback(root, b"a" * (NAME_LIMIT + 1) + b"\n"),
+    "byte-after-max-name-lf": lambda root: fallback(root, b"a" * (NAME_LIMIT - 3) + b".md\nx"),
     "non-utf8-sidecar": lambda root: fallback(root, b"x\xff.md\n"),
     "two-lines-sidecar": lambda root: fallback(root, b"first.md\nsecond.md\n"),
     "nul-sidecar": lambda root: fallback(root, b"x\0.md\n"),
@@ -299,6 +388,8 @@ CASES = {
         "", ".", "..", "a/b.md", "a\\b.md", "a\0b.md", "a\x7fb.md", "a\u202eb.md",
         "a\u2028b.md", "a\u2029b.md", "a\udcffb.md", "a" + "я" * 90 + ".md",
     )),
+    "direct-missing-md-suffix": lambda root: direct_invalid(root, ("7_input_md",)),
+    "direct-empty-md-stem": lambda root: direct_invalid(root, (".md",)),
     **{f"handoff-{mode}": lambda root, mode=mode: handoff(root, mode)
        for mode in ("convert", "nonconvert", "name-rename-fails", "job-rename-fails")},
     **{f"cleanup-{outcome}": lambda root, outcome=outcome: daemon_cleanup(root, outcome)

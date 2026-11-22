@@ -8,6 +8,8 @@ backup="$1"
 python3 "$r4_lib" validate-backup "$backup"
 phase=rollback-stop-intake
 systemctl stop mycelium-intake
+phase=rollback-drain
+python3 "$r4_lib" drain "$backup" rollback
 phase=rollback-stop-worker
 systemctl stop fs-triage-worker
 phase=rollback-files

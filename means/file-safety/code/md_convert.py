@@ -266,8 +266,8 @@ def valid_md_name(name):
         size = len(name.encode("utf-8"))
     except UnicodeEncodeError:
         return False
-    return (0 < size <= MAX_ARCHIVE_MD_NAME_BYTES
-            and name not in (".", "..")
+    return (size <= MAX_ARCHIVE_MD_NAME_BYTES
+            and len(name) > len(".md") and name.endswith(".md")
             and not any(ch in "/\\\0" or unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp")
                         for ch in name))
 

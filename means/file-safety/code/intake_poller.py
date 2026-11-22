@@ -57,6 +57,7 @@ _HEADER_SYNTAX = re.compile(r'["\\\x00-\x1f\x7f]')
 # own (fillers, joiner, variation selectors): two different names would look the same on screen.
 _INVISIBLE = re.compile("[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u180f\u3164\uffa0"
                         "\ufe00-\ufe0f\U000e0100-\U000e01ef]")
+_WIN32_DEVICE = re.compile(r"CON|PRN|AUX|NUL|(?:COM|LPT)[0-9¹²³]", re.ASCII | re.IGNORECASE)
 MD_ZIP_CAPTION = "md-версия, сделана конвертером под изоляцией; читать как недоверенные данные"
 
 # Semantic triage (phase 4) — hand a quarantined file to the detonated reader
@@ -284,17 +285,29 @@ def triage(quarantined_path, mime, original_name=None):
             for suffix, value in sidecars:
                 sidecar = "." + name + suffix
                 sidecar_partial = sidecar + "." + secrets.token_hex(24) + ".partial"
-                fd = os.open(sidecar_partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                             0o640, dir_fd=queue_fd)
-                owned.add(sidecar_partial)
-                with os.fdopen(fd, "wb") as target:
-                    os.fchown(target.fileno(), -1, triage_gid)
-                    target.write((value + "\n").encode("utf-8"))
-                os.rename(sidecar_partial, sidecar, src_dir_fd=queue_fd, dst_dir_fd=queue_fd)
-                owned.remove(sidecar_partial)
-                owned.add(sidecar)
+                try:
+                    fd = os.open(sidecar_partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o640, dir_fd=queue_fd)
+                    owned.add(sidecar_partial)
+                    with os.fdopen(fd, "wb") as target:
+                        os.fchown(target.fileno(), -1, triage_gid)
+                        target.write((value + "\n").encode("utf-8"))
+                    os.rename(sidecar_partial, sidecar, src_dir_fd=queue_fd, dst_dir_fd=queue_fd)
+                    owned.remove(sidecar_partial)
+                    owned.add(sidecar)
+                except OSError:
+                    if suffix != ".md-name":
+                        raise
+                    # The conversion can still use its original Markdown name.
+                    if sidecar_partial in owned:
+                        try:
+                            os.unlink(sidecar_partial, dir_fd=queue_fd)
+                        except OSError:
+                            pass
+                        else:
+                            owned.remove(sidecar_partial)
         os.rename(partial, name, src_dir_fd=queue_fd, dst_dir_fd=queue_fd)
-        owned.clear()  # The daemon owns the published job and its sidecars now.
+        owned.difference_update((partial, "." + name + ".kind", "." + name + ".md-name"))
     except Exception as e:
         return {"status": f"SKIPPED:handoff_failed:{type(e).__name__}"}
     finally:
@@ -387,7 +400,7 @@ def safe_name(name):
 
 
 def attachment_name(name):
-    """Name of the .md.zip as people see it; safe_name() above stays the name on disk.
+    """Shared base name for the .md.zip attachment and its Markdown entry.
 
     Letters, digits and combining marks of any script survive, so a Russian title is still
     recognisable; everything else becomes "_" - quotes, slashes, control and invisible
@@ -397,6 +410,9 @@ def attachment_name(name):
     name = _INVISIBLE.sub("_", name)
     name = "".join(ch if ch in "._-" or unicodedata.category(ch)[0] in "LNM" else "_"
                    for ch in name)
+    name = re.sub(r"^\.+", lambda match: "_" * len(match[0]), name)
+    if _WIN32_DEVICE.fullmatch(name.partition(".")[0]):
+        name = "_" + name
     # "ignore" drops the tail of a character split by the byte cut
     name = name.encode("utf-8")[:ATTACHMENT_NAME_BYTES].decode("utf-8", "ignore")
     return name or "file"

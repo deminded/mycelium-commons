@@ -254,22 +254,30 @@ def snapshot(backup, tag):
     return saved
 
 
-def drain(backup):
-    # Catch blockers created since preflight immediately, before waiting for inbox.
-    snapshot(backup, 'after-stop')
-    transition_checks(inventory())
+def drain(backup, mode='deploy'):
+    rollback = mode == 'rollback'
+    tag_prefix = 'rollback-' if rollback else ''
+    snapshot(backup, tag_prefix + 'after-stop')
+    if not rollback:
+        # Catch blockers created since preflight immediately, before waiting for inbox.
+        transition_checks(inventory())
     deadline = time.monotonic() + (0.05 if TEST_ROOT else 300)
     while True:
-        subprocess.run(['systemctl', 'is-active', '--quiet', 'fs-triage-worker'], check=True)
         with os.scandir(TRIAGE / 'inbox') as entries:
-            pending = [e.name for e in entries if not e.name.startswith('.')]
-        if not pending:
-            break  # process() removes the source only in its final cleanup.
-        if time.monotonic() >= deadline:
-            snapshot(backup, 'drain-timeout')
+            # Rollback must also wait for the newer worker to remove its sidecars.
+            pending = [e.name for e in entries if rollback or not e.name.startswith('.')]
+        if pending and time.monotonic() >= deadline:
+            snapshot(backup, tag_prefix + 'drain-timeout')
             raise ValueError(f'drain timeout (300s); pending={pending!r}; keep intake stopped, reconcile queues')
+        if pending or not rollback:
+            subprocess.run(['systemctl', 'is-active', '--quiet', 'fs-triage-worker'], check=True)
+        if not pending:
+            break
         time.sleep(0.01 if TEST_ROOT else 1)
-    state = snapshot(backup, 'drained')
+    state = snapshot(backup, tag_prefix + 'drained')
+    if rollback:
+        # Intake is stopped. Leave completed results in outbox for reconciliation.
+        return
     transition_checks(state['queues'])
     # Orphaned output, dot-partials/kind, incoming data cannot be silently re-enqueued.
     leftovers = {p: entries for p, entries in state['queues'].items()
